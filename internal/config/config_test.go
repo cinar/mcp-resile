@@ -93,7 +93,7 @@ backends:
   - id: "svc"
     url: "http://svc.internal/mcp"
 `,
-			wantErr: "server.listen is required",
+			wantErr: "Server.Listen: is required",
 		},
 		{
 			name: "unsupported server transport",
@@ -105,7 +105,7 @@ backends:
   - id: "svc"
     url: "http://svc.internal/mcp"
 `,
-			wantErr: "server.transport",
+			wantErr: "Server.Transport: unsupported transport",
 		},
 		{
 			name: "no backends",
@@ -137,7 +137,7 @@ server:
 backends:
   - url: "http://svc.internal/mcp"
 `,
-			wantErr: "backends[0].id is required",
+			wantErr: "Backends[0].ID: is required",
 		},
 		{
 			name: "missing backend url",
@@ -147,7 +147,18 @@ server:
 backends:
   - id: "svc"
 `,
-			wantErr: "backends[0].url is required",
+			wantErr: "Backends[0].URL: is required",
+		},
+		{
+			name: "invalid backend url",
+			yaml: `
+server:
+  listen: "0.0.0.0:8080"
+backends:
+  - id: "svc"
+    url: "not-a-url"
+`,
+			wantErr: "Backends[0].URL",
 		},
 		{
 			name: "unsupported backend transport",
@@ -159,7 +170,7 @@ backends:
     url: "http://svc.internal/mcp"
     transport: "stdio"
 `,
-			wantErr: "backends[0].transport",
+			wantErr: "Backends[0].Transport: unsupported transport",
 		},
 		{
 			name: "malformed duration",
