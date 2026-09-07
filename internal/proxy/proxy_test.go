@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -70,7 +71,7 @@ func newTestResourceBackend(t *testing.T) string {
 func dialTestBackend(t *testing.T, url string) *egress.Backend {
 	t.Helper()
 
-	backend, err := egress.Dial(context.Background(), "mcp-resile", "test", url)
+	backend, err := egress.Dial(context.Background(), "mcp-resile", "test", url, egress.DialOptions{})
 	if err != nil {
 		t.Fatalf("egress.Dial: %v", err)
 	}
@@ -80,12 +81,84 @@ func dialTestBackend(t *testing.T, url string) *egress.Backend {
 }
 
 // newTestGateway stands up the gateway's own ingress server with the proxy
-// middleware attached to routes, returning its URL.
+// middleware attached to routes, returning its URL. Its NotificationRouter
+// is private to this gateway; tests exercising notification forwarding
+// build their own wiring instead, since that requires sharing one router
+// between the egress.Dial call and the gateway (see
+// newRoutedTestSystem).
 func newTestGateway(t *testing.T, routes []proxy.Route) string {
 	t.Helper()
 
+	router := proxy.NewNotificationRouter()
 	server := ingress.NewServer("mcp-resile", "test", proxy.MergeCapabilities(routes))
-	server.AddReceivingMiddleware(proxy.Middleware(routes))
+	router.Attach(server)
+	server.AddReceivingMiddleware(proxy.Middleware(routes, router))
+
+	httpServer := httptest.NewServer(ingress.NewHandler(server))
+	t.Cleanup(httpServer.Close)
+
+	return httpServer.URL
+}
+
+type notifyInput struct {
+	Marker string `json:"marker"`
+}
+
+// newTestNotifyBackend starts a backend exposing a "notify" tool that, if
+// the caller set a progress token, reports progress carrying that token and
+// in.Marker before returning in.Marker as its result.
+func newTestNotifyBackend(t *testing.T) string {
+	t.Helper()
+
+	server := mcp.NewServer(&mcp.Implementation{Name: "backend", Version: "test"}, nil)
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "notify",
+		Description: "Reports progress, then echoes marker back",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in notifyInput) (*mcp.CallToolResult, echoOutput, error) {
+		if token := req.Params.GetProgressToken(); token != nil {
+			if err := req.Session.NotifyProgress(ctx, &mcp.ProgressNotificationParams{
+				ProgressToken: token,
+				Message:       in.Marker,
+				Progress:      1,
+			}); err != nil {
+				return nil, echoOutput{}, err
+			}
+		}
+		return nil, echoOutput{Text: in.Marker}, nil
+	})
+
+	handler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server {
+		return server
+	}, nil)
+	httpServer := httptest.NewServer(handler)
+	t.Cleanup(httpServer.Close)
+
+	return httpServer.URL
+}
+
+// newRoutedTestSystem wires a single backend at backendURL into a gateway,
+// sharing one NotificationRouter between them so backend-initiated
+// notifications (progress, logging) are actually forwarded, and returns the
+// gateway's URL. dialTestBackend/newTestGateway can't be composed for this,
+// since egress.Dial (backend side) and the gateway's own server both need
+// the same router instance.
+func newRoutedTestSystem(t *testing.T, backendURL string) string {
+	t.Helper()
+
+	router := proxy.NewNotificationRouter()
+	backend, err := egress.Dial(context.Background(), "mcp-resile", "test", backendURL, egress.DialOptions{
+		OnProgress: router.HandleProgress,
+		OnLog:      router.HandleLog,
+	})
+	if err != nil {
+		t.Fatalf("egress.Dial: %v", err)
+	}
+	t.Cleanup(func() { backend.Close() })
+
+	routes := []proxy.Route{{Prefix: "", Backend: backend}}
+	server := ingress.NewServer("mcp-resile", "test", proxy.MergeCapabilities(routes))
+	router.Attach(server)
+	server.AddReceivingMiddleware(proxy.Middleware(routes, router))
 
 	httpServer := httptest.NewServer(ingress.NewHandler(server))
 	t.Cleanup(httpServer.Close)
@@ -216,6 +289,164 @@ func TestCapabilityMerging(t *testing.T) {
 	}
 	if caps.Prompts != nil {
 		t.Errorf("Capabilities.Prompts = %+v, want nil since no backend has a prompt", caps.Prompts)
+	}
+}
+
+// TestProgressNotificationForwarding proves a backend's
+// notifications/progress reaches the client that made the call, with the
+// client's own progress token restored (FEATURE-009).
+func TestProgressNotificationForwarding(t *testing.T) {
+	ctx := context.Background()
+	gatewayURL := newRoutedTestSystem(t, newTestNotifyBackend(t))
+
+	progress := make(chan *mcp.ProgressNotificationParams, 1)
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v0"}, &mcp.ClientOptions{
+		ProgressNotificationHandler: func(_ context.Context, req *mcp.ProgressNotificationClientRequest) {
+			progress <- req.Params
+		},
+	})
+	session, err := client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: gatewayURL}, nil)
+	if err != nil {
+		t.Fatalf("client.Connect: %v", err)
+	}
+	t.Cleanup(func() { session.Close() })
+
+	params := &mcp.CallToolParams{Name: "notify", Arguments: map[string]any{"marker": "hello"}}
+	params.SetProgressToken("client-token")
+
+	result, err := session.CallTool(ctx, params)
+	if err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("CallTool result.IsError = true: %+v", result.Content)
+	}
+
+	select {
+	case got := <-progress:
+		if got.Message != "hello" {
+			t.Errorf("progress.Message = %q, want %q", got.Message, "hello")
+		}
+		if got.ProgressToken != "client-token" {
+			t.Errorf("progress.ProgressToken = %v, want the client's own token %q restored", got.ProgressToken, "client-token")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for notifications/progress to be forwarded")
+	}
+}
+
+// TestProgressNotificationRoutedByClient proves two clients sharing one
+// backend connection, who happen to pick the identical progress token,
+// each get only their own progress notifications rather than each other's
+// (FEATURE-009) — the scenario NotificationRouter's token rewriting exists
+// for.
+func TestProgressNotificationRoutedByClient(t *testing.T) {
+	ctx := context.Background()
+	gatewayURL := newRoutedTestSystem(t, newTestNotifyBackend(t))
+
+	type testClient struct {
+		session  *mcp.ClientSession
+		progress chan *mcp.ProgressNotificationParams
+	}
+	newClient := func() testClient {
+		progress := make(chan *mcp.ProgressNotificationParams, 1)
+		c := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v0"}, &mcp.ClientOptions{
+			ProgressNotificationHandler: func(_ context.Context, req *mcp.ProgressNotificationClientRequest) {
+				progress <- req.Params
+			},
+		})
+		session, err := c.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: gatewayURL}, nil)
+		if err != nil {
+			t.Fatalf("client.Connect: %v", err)
+		}
+		t.Cleanup(func() { session.Close() })
+		return testClient{session: session, progress: progress}
+	}
+
+	a, b := newClient(), newClient()
+
+	call := func(c testClient, marker string) error {
+		params := &mcp.CallToolParams{Name: "notify", Arguments: map[string]any{"marker": marker}}
+		params.SetProgressToken("same-token")
+		_, err := c.session.CallTool(ctx, params)
+		return err
+	}
+
+	errs := make(chan error, 2)
+	go func() { errs <- call(a, "from-a") }()
+	go func() { errs <- call(b, "from-b") }()
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Fatalf("CallTool: %v", err)
+		}
+	}
+
+	for _, want := range []struct {
+		client testClient
+		marker string
+	}{{a, "from-a"}, {b, "from-b"}} {
+		select {
+		case got := <-want.client.progress:
+			if got.Message != want.marker {
+				t.Errorf("progress.Message = %q, want %q", got.Message, want.marker)
+			}
+			if got.ProgressToken != "same-token" {
+				t.Errorf("progress.ProgressToken = %v, want %q", got.ProgressToken, "same-token")
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for progress for marker %q", want.marker)
+		}
+	}
+}
+
+// TestLogMessageBroadcast proves a backend's notifications/message reaches
+// a connected client once it has opted in via logging/setLevel (FEATURE-009).
+func TestLogMessageBroadcast(t *testing.T) {
+	ctx := context.Background()
+
+	server := mcp.NewServer(&mcp.Implementation{Name: "backend", Version: "test"}, nil)
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "log",
+		Description: "Sends a log message back to the caller",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in struct{}) (*mcp.CallToolResult, struct{}, error) {
+		err := req.Session.Log(ctx, &mcp.LoggingMessageParams{Level: "info", Data: "hello from backend"})
+		return nil, struct{}{}, err
+	})
+	handler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server {
+		return server
+	}, nil)
+	backendHTTP := httptest.NewServer(handler)
+	t.Cleanup(backendHTTP.Close)
+
+	gatewayURL := newRoutedTestSystem(t, backendHTTP.URL)
+
+	logs := make(chan *mcp.LoggingMessageParams, 1)
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v0"}, &mcp.ClientOptions{
+		LoggingMessageHandler: func(_ context.Context, req *mcp.LoggingMessageRequest) {
+			logs <- req.Params
+		},
+	})
+	session, err := client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: gatewayURL}, nil)
+	if err != nil {
+		t.Fatalf("client.Connect: %v", err)
+	}
+	t.Cleanup(func() { session.Close() })
+
+	if err := session.SetLoggingLevel(ctx, &mcp.SetLoggingLevelParams{Level: "debug"}); err != nil {
+		t.Fatalf("SetLoggingLevel: %v", err)
+	}
+
+	if _, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "log", Arguments: map[string]any{}}); err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+
+	select {
+	case got := <-logs:
+		if got.Data != "hello from backend" {
+			t.Errorf("log.Data = %v, want %q", got.Data, "hello from backend")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for notifications/message to be forwarded")
 	}
 }
 

@@ -8,6 +8,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/cinar/mcp-resile/internal/config"
+	"github.com/cinar/mcp-resile/internal/proxy"
 )
 
 // TestDialBackendsSkipsUnreachable proves a backend that's down at startup
@@ -26,7 +27,7 @@ func TestDialBackendsSkipsUnreachable(t *testing.T) {
 		{ID: "up", Prefix: "up_", URL: httpServer.URL},
 	}
 
-	routes, closeAll := dialBackends(backends)
+	routes, closeAll := dialBackends(backends, proxy.NewNotificationRouter())
 	defer closeAll()
 
 	if len(routes) != 1 {

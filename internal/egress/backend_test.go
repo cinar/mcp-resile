@@ -47,7 +47,7 @@ func TestListAndCallTool(t *testing.T) {
 	ctx := context.Background()
 	url := newTestBackend(t)
 
-	backend, err := egress.Dial(ctx, "mcp-resile", "test", url)
+	backend, err := egress.Dial(ctx, "mcp-resile", "test", url, egress.DialOptions{})
 	if err != nil {
 		t.Fatalf("egress.Dial: %v", err)
 	}

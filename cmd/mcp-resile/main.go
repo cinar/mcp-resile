@@ -36,11 +36,14 @@ func run(configPath string) error {
 		return fmt.Errorf("loading config: %w", err)
 	}
 
-	routes, closeBackends := dialBackends(cfg.Backends)
+	router := proxy.NewNotificationRouter()
+
+	routes, closeBackends := dialBackends(cfg.Backends, router)
 	defer closeBackends()
 
 	server := ingress.NewServer(serverName, version.Version, proxy.MergeCapabilities(routes))
-	server.AddReceivingMiddleware(proxy.Middleware(routes))
+	router.Attach(server)
+	server.AddReceivingMiddleware(proxy.Middleware(routes, router))
 
 	httpServer := &http.Server{
 		Addr:         cfg.Server.Listen,
@@ -54,11 +57,12 @@ func run(configPath string) error {
 }
 
 // dialBackends opens an egress session to every configured backend that is
-// currently reachable. A backend that fails to dial is logged and skipped
-// rather than aborting startup, so one down backend never blocks the others
-// from being usable (FEATURE-008); the gateway simply starts with whatever
-// routes it managed to establish, even zero.
-func dialBackends(backends []config.Backend) (routes []proxy.Route, closeAll func()) {
+// currently reachable, wiring router's handlers so backend notifications
+// get forwarded to clients. A backend that fails to dial is logged and
+// skipped rather than aborting startup, so one down backend never blocks
+// the others from being usable (FEATURE-008); the gateway simply starts
+// with whatever routes it managed to establish, even zero.
+func dialBackends(backends []config.Backend, router *proxy.NotificationRouter) (routes []proxy.Route, closeAll func()) {
 	dialed := make([]*egress.Backend, 0, len(backends))
 	closeAll = func() {
 		for _, backend := range dialed {
@@ -67,7 +71,10 @@ func dialBackends(backends []config.Backend) (routes []proxy.Route, closeAll fun
 	}
 
 	for _, backendCfg := range backends {
-		backend, err := egress.Dial(context.Background(), serverName, version.Version, backendCfg.URL)
+		backend, err := egress.Dial(context.Background(), serverName, version.Version, backendCfg.URL, egress.DialOptions{
+			OnProgress: router.HandleProgress,
+			OnLog:      router.HandleLog,
+		})
 		if err != nil {
 			log.Printf("backend %s (%s) unreachable at startup, skipping: %v", backendCfg.ID, backendCfg.URL, err)
 			continue

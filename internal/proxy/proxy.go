@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -36,15 +37,19 @@ type Route struct {
 // (longest prefix wins), stripping the prefix before forwarding. A
 // tools/call for a name that matches no route falls through to next, which
 // reports it as an unknown tool exactly as a single, un-proxied server
-// would.
-func Middleware(routes []Route) mcp.Middleware {
+// would. router tracks progress tokens across the call so a later
+// notifications/progress from the backend can be routed back to the right
+// client (FEATURE-009); notifications/cancelled needs no handling here,
+// since it propagates automatically through ctx (see NotificationRouter's
+// doc comment).
+func Middleware(routes []Route, router *NotificationRouter) mcp.Middleware {
 	return func(next mcp.MethodHandler) mcp.MethodHandler {
 		return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
 			switch method {
 			case methodListTools:
 				return listTools(ctx, routes)
 			case methodCallTool:
-				return callTool(ctx, routes, req, next)
+				return callTool(ctx, routes, req, next, router)
 			default:
 				return next(ctx, method, req)
 			}
@@ -74,8 +79,11 @@ func listTools(ctx context.Context, routes []Route) (*mcp.ListToolsResult, error
 }
 
 // callTool routes a tools/call request to the matching backend, or falls
-// through to next if no route matches.
-func callTool(ctx context.Context, routes []Route, req mcp.Request, next mcp.MethodHandler) (mcp.Result, error) {
+// through to next if no route matches. If the request carries a progress
+// token, it's swapped for one that identifies this call uniquely to router
+// before forwarding, so a resulting notifications/progress from the backend
+// can be routed back to the calling client and restored to its own token.
+func callTool(ctx context.Context, routes []Route, req mcp.Request, next mcp.MethodHandler, router *NotificationRouter) (mcp.Result, error) {
 	params, ok := req.GetParams().(*mcp.CallToolParamsRaw)
 	if !ok {
 		return nil, fmt.Errorf("proxy: unexpected params type %T for %s", req.GetParams(), methodCallTool)
@@ -86,11 +94,21 @@ func callTool(ctx context.Context, routes []Route, req mcp.Request, next mcp.Met
 		return next(ctx, methodCallTool, req)
 	}
 
-	return route.Backend.CallTool(ctx, &mcp.CallToolParams{
-		Meta:      params.Meta,
+	forwarded := &mcp.CallToolParams{
+		Meta:      maps.Clone(params.Meta),
 		Name:      name,
 		Arguments: json.RawMessage(params.Arguments),
-	})
+	}
+
+	if session, ok := req.GetSession().(*mcp.ServerSession); ok {
+		token, done := router.TrackProgress(session, params.GetProgressToken())
+		defer done()
+		if token != "" {
+			forwarded.SetProgressToken(token)
+		}
+	}
+
+	return route.Backend.CallTool(ctx, forwarded)
 }
 
 // MergeCapabilities returns the union of every route's backend capabilities
