@@ -43,6 +43,29 @@ func newTestBackend(t *testing.T, toolName string) string {
 	return httpServer.URL
 }
 
+// newTestResourceBackend starts a real MCP server exposing a single
+// resource and no tools, standing in for a backend whose only capability is
+// resources.
+func newTestResourceBackend(t *testing.T) string {
+	t.Helper()
+
+	server := mcp.NewServer(&mcp.Implementation{Name: "backend", Version: "test"}, nil)
+	server.AddResource(&mcp.Resource{
+		URI:  "test://thing",
+		Name: "thing",
+	}, func(context.Context, *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
+		return &mcp.ReadResourceResult{}, nil
+	})
+
+	handler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server {
+		return server
+	}, nil)
+	httpServer := httptest.NewServer(handler)
+	t.Cleanup(httpServer.Close)
+
+	return httpServer.URL
+}
+
 // dialTestBackend dials url and registers its Close for cleanup.
 func dialTestBackend(t *testing.T, url string) *egress.Backend {
 	t.Helper()
@@ -61,7 +84,7 @@ func dialTestBackend(t *testing.T, url string) *egress.Backend {
 func newTestGateway(t *testing.T, routes []proxy.Route) string {
 	t.Helper()
 
-	server := ingress.NewServer("mcp-resile", "test")
+	server := ingress.NewServer("mcp-resile", "test", proxy.MergeCapabilities(routes))
 	server.AddReceivingMiddleware(proxy.Middleware(routes))
 
 	httpServer := httptest.NewServer(ingress.NewHandler(server))
@@ -163,6 +186,36 @@ func TestMultiBackendNamespaceRouting(t *testing.T) {
 	}
 	if got := jiraResult.StructuredContent.(map[string]any)["text"]; got != "from-jira" {
 		t.Errorf("jira_query result = %v, want from-jira", got)
+	}
+}
+
+// TestCapabilityMerging proves the gateway's own initialize response
+// reflects the union of its backends' capabilities, even though the gateway
+// registers no tools/resources/prompts of its own (FEATURE-008). One
+// backend offers only a tool, the other only a resource; the gateway must
+// advertise both.
+func TestCapabilityMerging(t *testing.T) {
+	toolBackend := dialTestBackend(t, newTestBackend(t, "query"))
+	resourceBackend := dialTestBackend(t, newTestResourceBackend(t))
+
+	gatewayURL := newTestGateway(t, []proxy.Route{
+		{Prefix: "db_", Backend: toolBackend},
+		{Prefix: "res_", Backend: resourceBackend},
+	})
+	session := connect(t, gatewayURL)
+
+	caps := session.InitializeResult().Capabilities
+	if caps == nil {
+		t.Fatal("InitializeResult().Capabilities = nil, want a merged set of capabilities")
+	}
+	if caps.Tools == nil {
+		t.Error("Capabilities.Tools = nil, want non-nil since a backend has a tool")
+	}
+	if caps.Resources == nil {
+		t.Error("Capabilities.Resources = nil, want non-nil since a backend has a resource")
+	}
+	if caps.Prompts != nil {
+		t.Errorf("Capabilities.Prompts = %+v, want nil since no backend has a prompt", caps.Prompts)
 	}
 }
 

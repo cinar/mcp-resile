@@ -15,7 +15,7 @@ import (
 func TestInitialize(t *testing.T) {
 	ctx := context.Background()
 
-	server := ingress.NewServer("mcp-resile", "test")
+	server := ingress.NewServer("mcp-resile", "test", nil)
 	httpServer := httptest.NewServer(ingress.NewHandler(server))
 	defer httpServer.Close()
 

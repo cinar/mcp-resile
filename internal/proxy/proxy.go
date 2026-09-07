@@ -93,6 +93,48 @@ func callTool(ctx context.Context, routes []Route, req mcp.Request, next mcp.Met
 	})
 }
 
+// MergeCapabilities returns the union of every route's backend capabilities
+// (tools, resources, prompts), per spec.md §5.1: a capability is present if
+// any backend advertises it, and its ListChanged/Subscribe flags are true if
+// any backend sets them. The gateway itself never registers tools,
+// resources, or prompts on its own SDK server (routing is done via
+// middleware instead), so without this its initialize response would
+// advertise none of them regardless of what the backends actually offer.
+func MergeCapabilities(routes []Route) *mcp.ServerCapabilities {
+	merged := &mcp.ServerCapabilities{Logging: &mcp.LoggingCapabilities{}}
+
+	for _, route := range routes {
+		caps := route.Backend.Capabilities()
+		if caps == nil {
+			continue
+		}
+
+		if caps.Tools != nil {
+			if merged.Tools == nil {
+				merged.Tools = &mcp.ToolCapabilities{}
+			}
+			merged.Tools.ListChanged = merged.Tools.ListChanged || caps.Tools.ListChanged
+		}
+
+		if caps.Resources != nil {
+			if merged.Resources == nil {
+				merged.Resources = &mcp.ResourceCapabilities{}
+			}
+			merged.Resources.ListChanged = merged.Resources.ListChanged || caps.Resources.ListChanged
+			merged.Resources.Subscribe = merged.Resources.Subscribe || caps.Resources.Subscribe
+		}
+
+		if caps.Prompts != nil {
+			if merged.Prompts == nil {
+				merged.Prompts = &mcp.PromptCapabilities{}
+			}
+			merged.Prompts.ListChanged = merged.Prompts.ListChanged || caps.Prompts.ListChanged
+		}
+	}
+
+	return merged
+}
+
 // matchRoute finds the route whose prefix matches toolName, preferring the
 // longest prefix so a more specific prefix always wins over a shorter (or
 // empty, catch-all) one. It returns the tool name with that prefix

@@ -8,11 +8,15 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// NewServer creates the gateway's MCP server identity. It exposes no tools
-// or middleware of its own yet; routing to backends is wired in by later
-// features (FEATURE-006 onward).
-func NewServer(name, version string) *mcp.Server {
-	return mcp.NewServer(&mcp.Implementation{Name: name, Version: version}, nil)
+// NewServer creates the gateway's MCP server identity, advertising caps as
+// its capabilities. It exposes no tools, resources, or prompts of its own;
+// routing to backends is wired in via middleware by later features
+// (FEATURE-006 onward). Since the SDK only infers capabilities from a
+// server's own registered features, caps must reflect whatever the proxied
+// backends actually support (see proxy.MergeCapabilities); a nil caps falls
+// back to the SDK's bare defaults.
+func NewServer(name, version string, caps *mcp.ServerCapabilities) *mcp.Server {
+	return mcp.NewServer(&mcp.Implementation{Name: name, Version: version}, &mcp.ServerOptions{Capabilities: caps})
 }
 
 // NewHandler returns an http.Handler that serves server over the Streamable

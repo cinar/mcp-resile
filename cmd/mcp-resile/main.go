@@ -36,13 +36,10 @@ func run(configPath string) error {
 		return fmt.Errorf("loading config: %w", err)
 	}
 
-	routes, closeBackends, err := dialBackends(cfg.Backends)
-	if err != nil {
-		return err
-	}
+	routes, closeBackends := dialBackends(cfg.Backends)
 	defer closeBackends()
 
-	server := ingress.NewServer(serverName, version.Version)
+	server := ingress.NewServer(serverName, version.Version, proxy.MergeCapabilities(routes))
 	server.AddReceivingMiddleware(proxy.Middleware(routes))
 
 	httpServer := &http.Server{
@@ -56,12 +53,12 @@ func run(configPath string) error {
 	return httpServer.ListenAndServe()
 }
 
-// dialBackends opens an egress session to every configured backend. If any
-// dial fails, the ones that already succeeded are closed before returning
-// the error; the gateway either starts fully connected or not at all
-// (spreading startup resilience across partial backend outages is
-// FEATURE-008).
-func dialBackends(backends []config.Backend) (routes []proxy.Route, closeAll func(), err error) {
+// dialBackends opens an egress session to every configured backend that is
+// currently reachable. A backend that fails to dial is logged and skipped
+// rather than aborting startup, so one down backend never blocks the others
+// from being usable (FEATURE-008); the gateway simply starts with whatever
+// routes it managed to establish, even zero.
+func dialBackends(backends []config.Backend) (routes []proxy.Route, closeAll func()) {
 	dialed := make([]*egress.Backend, 0, len(backends))
 	closeAll = func() {
 		for _, backend := range dialed {
@@ -70,15 +67,15 @@ func dialBackends(backends []config.Backend) (routes []proxy.Route, closeAll fun
 	}
 
 	for _, backendCfg := range backends {
-		backend, dialErr := egress.Dial(context.Background(), serverName, version.Version, backendCfg.URL)
-		if dialErr != nil {
-			closeAll()
-			return nil, func() {}, fmt.Errorf("dialing backend %s: %w", backendCfg.ID, dialErr)
+		backend, err := egress.Dial(context.Background(), serverName, version.Version, backendCfg.URL)
+		if err != nil {
+			log.Printf("backend %s (%s) unreachable at startup, skipping: %v", backendCfg.ID, backendCfg.URL, err)
+			continue
 		}
 
 		dialed = append(dialed, backend)
 		routes = append(routes, proxy.Route{Prefix: backendCfg.Prefix, Backend: backend})
 	}
 
-	return routes, closeAll, nil
+	return routes, closeAll
 }

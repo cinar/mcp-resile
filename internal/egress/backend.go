@@ -34,6 +34,12 @@ func (b *Backend) CallTool(ctx context.Context, params *mcp.CallToolParams) (*mc
 	return b.session.CallTool(ctx, params)
 }
 
+// Capabilities returns the capabilities the backend advertised in its
+// initialize response.
+func (b *Backend) Capabilities() *mcp.ServerCapabilities {
+	return b.session.InitializeResult().Capabilities
+}
+
 // Close ends the backend session.
 func (b *Backend) Close() error {
 	return b.session.Close()
