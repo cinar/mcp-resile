@@ -6,12 +6,15 @@
 // auth and telemetry are wired in by later features. Missing or malformed
 // required fields are rejected here, at load time, rather than surfacing as
 // a confusing failure on the first request. Field validation is delegated
-// to github.com/cinar/checker via struct tags; rules checker can't express
-// — that prefixes/ids must be distinct across backends, that tool_pattern
-// must be a well-formed glob, and that an unrecognized YAML key anywhere in
-// the document is rejected rather than silently ignored (FEATURE-022) —
-// are checked separately, since checker only validates within one struct
-// and has no glob-syntax or unknown-field checker of its own.
+// to github.com/cinar/checker/v2 via struct tags — including into every
+// nested resilience.* pointer sub-block (circuit_breaker/retries/
+// rate_limit), which checker v2's CheckStruct can recurse into automatically
+// (v1 could not: it only auto-recursed into non-pointer struct fields). What
+// checker still can't express — that prefixes/ids must be distinct across
+// backends, that tool_pattern must be a well-formed glob, and that an
+// unrecognized YAML key anywhere in the document is rejected rather than
+// silently ignored (FEATURE-022) — is checked separately, since those are
+// either cross-element comparisons or outside checker's domain entirely.
 package config
 
 import (
@@ -21,11 +24,9 @@ import (
 	"io"
 	"os"
 	"path"
-	"sort"
-	"strings"
 	"time"
 
-	"github.com/cinar/checker"
+	checker "github.com/cinar/checker/v2"
 	"gopkg.in/yaml.v3"
 )
 
@@ -68,18 +69,6 @@ const (
 	defaultRetryMaxDelay    = 30 * time.Second
 )
 
-// errUnsupportedServerTransport and errUnsupportedBackendTransport back the
-// checker.Register'd checkers below.
-var (
-	errUnsupportedServerTransport  = fmt.Errorf("unsupported transport, only %q is supported in v1", transportStreamableHTTP)
-	errUnsupportedBackendTransport = fmt.Errorf("unsupported transport, only %q is supported in v1", backendTransportHTTP)
-)
-
-func init() {
-	checker.Register("server-transport", checker.MakeRegexpMaker("^"+transportStreamableHTTP+"$", errUnsupportedServerTransport))
-	checker.Register("backend-transport", checker.MakeRegexpMaker("^"+backendTransportHTTP+"$", errUnsupportedBackendTransport))
-}
-
 // Duration wraps time.Duration to unmarshal from YAML duration strings
 // (e.g. "30s"); time.Duration has no native YAML text encoding.
 type Duration time.Duration
@@ -101,17 +90,17 @@ func (d *Duration) UnmarshalYAML(value *yaml.Node) error {
 // Server is the server: section of the config.
 type Server struct {
 	Listen           string   `yaml:"listen" checkers:"required"`
-	Transport        string   `yaml:"transport" checkers:"server-transport"`
-	ReadTimeout      Duration `yaml:"read_timeout" checkers:"min:1"`
-	WriteTimeout     Duration `yaml:"write_timeout" checkers:"min:1"`
-	MaxRequestBytes  int64    `yaml:"max_request_bytes" checkers:"min:1"`
-	MaxResponseBytes int64    `yaml:"max_response_bytes" checkers:"min:1"`
+	Transport        string   `yaml:"transport" checkers:"oneof:streamable-http"`
+	ReadTimeout      Duration `yaml:"read_timeout" checkers:"gte:1"`
+	WriteTimeout     Duration `yaml:"write_timeout" checkers:"gte:1"`
+	MaxRequestBytes  int64    `yaml:"max_request_bytes" checkers:"gte:1"`
+	MaxResponseBytes int64    `yaml:"max_response_bytes" checkers:"gte:1"`
 }
 
 // Backend is one entry of the backends: list.
 type Backend struct {
 	ID        string `yaml:"id" checkers:"required"`
-	Transport string `yaml:"transport" checkers:"backend-transport"`
+	Transport string `yaml:"transport" checkers:"oneof:http"`
 	Prefix    string `yaml:"prefix"`
 	URL       string `yaml:"url" checkers:"required url"`
 }
@@ -119,38 +108,47 @@ type Backend struct {
 // CircuitBreaker is the resilience.circuit_breaker: sub-block of a policy
 // (spec.md §7), mapping directly onto github.com/cinar/resile/circuit.Config
 // (FEATURE-011). A zero value for any field leaves resile's own circuit.New
-// defaults in effect (50% failure rate, 60s window, 60s reset) — checker
-// can't validate these (it only auto-recurses into non-pointer struct
-// fields, and this one is a pointer so config.Policy can tell "circuit
-// breaker omitted" apart from "circuit breaker present with defaults"), so
-// validateCircuitBreaker checks them by hand.
+// defaults in effect (50% failure rate, 60s window, 60s reset). It's a
+// pointer field on Resilience so config.Policy can tell "circuit breaker
+// omitted" apart from "circuit breaker present with defaults" — but unlike
+// v1's checker, v2's CheckStruct dereferences a non-nil pointer field and
+// recurses into it just like any other struct (a nil one is left alone), so
+// FailureRate/WindowDuration/ResetTimeout's own checkers tags are enough;
+// there's no more a validateCircuitBreaker hand-check to keep in sync with
+// them.
 type CircuitBreaker struct {
-	FailureRate    float64  `yaml:"failure_rate"`
-	WindowDuration Duration `yaml:"window_duration"`
-	ResetTimeout   Duration `yaml:"reset_timeout"`
+	FailureRate    float64  `yaml:"failure_rate" checkers:"gte:0 lte:100"`
+	WindowDuration Duration `yaml:"window_duration" checkers:"gte:0"`
+	ResetTimeout   Duration `yaml:"reset_timeout" checkers:"gte:0"`
 }
 
 // Retries is the resilience.retries: sub-block of a policy (spec.md §7),
 // mapping onto resile.WithMaxAttempts/WithBackoff (FEATURE-012). Like
 // CircuitBreaker, it's a pointer so "retries omitted" and "retries present
-// with defaults" stay distinguishable, and so validateRetries/applyDefaults
-// handle it by hand rather than via checker's struct-field auto-recursion.
+// with defaults" stay distinguishable; applyDefaults still fills in its
+// zero fields by hand (including Backoff, before oneof below ever sees it —
+// an empty Backoff would otherwise fail oneof rather than be defaulted).
+// MaxAttempts carries no checkers tag: it's a uint (never negative to begin
+// with), and applyDefaults already replaces an explicit 0 with
+// defaultRetryMaxAttempts, so no value ever reaches validation for it to
+// reject.
 type Retries struct {
 	MaxAttempts uint     `yaml:"max_attempts"`
-	BaseDelay   Duration `yaml:"base_delay"`
-	MaxDelay    Duration `yaml:"max_delay"`
-	Backoff     string   `yaml:"backoff"`
+	BaseDelay   Duration `yaml:"base_delay" checkers:"gte:0"`
+	MaxDelay    Duration `yaml:"max_delay" checkers:"gte:0"`
+	Backoff     string   `yaml:"backoff" checkers:"oneof:full_jitter"`
 }
 
 // RateLimit is the resilience.rate_limit: sub-block of a policy (spec.md
 // §7), mapping onto resile.NewRateLimiter (FEATURE-013). Unlike
 // CircuitBreaker/Retries, there's no sensible zero-value default: resile's
 // token bucket rejects every request at Rate 0, and divides by zero
-// internally at Interval 0 — so validateRateLimit requires both whenever
-// rate_limit: is present, rather than silently defaulting either.
+// internally at Interval 0 — so both fields require a strictly positive
+// value whenever rate_limit: is present at all (a nil RateLimit is skipped
+// entirely, same as CircuitBreaker/Retries).
 type RateLimit struct {
-	Rate     float64  `yaml:"rate"`
-	Interval Duration `yaml:"interval"`
+	Rate     float64  `yaml:"rate" checkers:"gt:0"`
+	Interval Duration `yaml:"interval" checkers:"gt:0"`
 }
 
 // Resilience is the resilience: sub-block of a policy (spec.md §7).
@@ -170,7 +168,7 @@ type Resilience struct {
 	CircuitBreaker       *CircuitBreaker `yaml:"circuit_breaker"`
 	Retries              *Retries        `yaml:"retries"`
 	RateLimit            *RateLimit      `yaml:"rate_limit"`
-	MinDeadlineThreshold Duration        `yaml:"min_deadline_threshold"`
+	MinDeadlineThreshold Duration        `yaml:"min_deadline_threshold" checkers:"gte:0"`
 	Timeout              Duration        `yaml:"timeout"`
 }
 
@@ -211,19 +209,25 @@ type Auth struct {
 // controlling the Prometheus /metrics endpoint (FEATURE-020). It's served on
 // its own listener (Port), separate from server.listen, so a scraper never
 // competes with MCP traffic for the same port or routes. Disabled by
-// default, like Auth.
+// default, like Auth. Port/Path's checkers tags apply unconditionally
+// (there's no "only when Enabled" gate), which is fine even when Metrics
+// isn't enabled: Port's zero value (0) and Path's default ("/metrics",
+// filled in by applyDefaults regardless of Enabled) both already satisfy
+// their own range/prefix checks.
 type Metrics struct {
 	Enabled bool   `yaml:"enabled"`
-	Port    int    `yaml:"port"`
-	Path    string `yaml:"path"`
+	Port    int    `yaml:"port" checkers:"gte:0 lte:65535"`
+	Path    string `yaml:"path" checkers:"omitempty starts-with:/"`
 }
 
 // Logging is the telemetry.logging: sub-block of the config (spec.md §7),
 // controlling the gateway's structured slog output (FEATURE-021). Level is
-// one of "debug"/"info"/"warn"/"error"; Format is "json" or "text".
+// one of "debug"/"info"/"warn"/"error"; Format is "json" or "text". Both are
+// always defaulted to a valid value by applyDefaults before checking runs,
+// so oneof always has something to check against.
 type Logging struct {
-	Level  string `yaml:"level"`
-	Format string `yaml:"format"`
+	Level  string `yaml:"level" checkers:"oneof:debug,info,warn,error"`
+	Format string `yaml:"format" checkers:"oneof:json,text"`
 }
 
 // Telemetry is the telemetry: section of the config (spec.md §7).
@@ -232,13 +236,19 @@ type Telemetry struct {
 	Logging Logging `yaml:"logging"`
 }
 
-// Config is the top-level mcp-resile.yaml document.
+// Config is the top-level mcp-resile.yaml document. Backends' "@" prefix
+// applies min-len to the slice itself (at least one backend), not to each
+// item — checker v2's own convention for telling a container-level check
+// apart from an item-level one (see the README's "Slice and Item Level
+// Checkers" section). min-len, not required, because Required's zero-value
+// check (IsZero) only catches a nil slice, not an explicitly empty
+// "backends: []" — min-len counts actual elements either way.
 type Config struct {
 	Version   string    `yaml:"version"`
 	Server    Server    `yaml:"server"`
 	Auth      Auth      `yaml:"auth"`
 	Telemetry Telemetry `yaml:"telemetry"`
-	Backends  []Backend `yaml:"backends" checkers:"required"`
+	Backends  []Backend `yaml:"backends" checkers:"@min-len:1"`
 	Policies  []Policy  `yaml:"policies"`
 }
 
@@ -277,30 +287,18 @@ func Parse(data []byte) (*Config, error) {
 
 	cfg.applyDefaults()
 
-	// checker.Check only recurses into struct-kind fields, so the Backends
-	// slice itself is checked here (for the required, non-empty rule), and
-	// each of its elements is checked separately in the loop below.
-	if errs, ok := checker.Check(&cfg); !ok {
-		return nil, checkerError("", errs)
-	}
-	for i := range cfg.Backends {
-		if errs, ok := checker.Check(&cfg.Backends[i]); !ok {
-			return nil, checkerError(fmt.Sprintf("Backends[%d].", i), errs)
-		}
-	}
-	for i := range cfg.Policies {
-		if errs, ok := checker.Check(&cfg.Policies[i]); !ok {
-			return nil, checkerError(fmt.Sprintf("Policies[%d].", i), errs)
-		}
+	// CheckStruct walks the whole config tree in one pass — every struct
+	// field, including down into each Backends/Policies element and every
+	// non-nil resilience.* pointer sub-block (FEATURE-011/012/013) — so,
+	// unlike v1's checker, there's no need to loop over cfg.Backends/
+	// cfg.Policies by hand just to check each element separately. Its
+	// CheckErrors return value already implements error (formatting as
+	// sorted "field.path: message" pairs), so it's returned directly.
+	if errs, ok := checker.CheckStruct(&cfg); !ok {
+		return nil, errs
 	}
 
 	if err := validateAuth(cfg.Auth); err != nil {
-		return nil, err
-	}
-	if err := validateTelemetry(cfg.Telemetry); err != nil {
-		return nil, err
-	}
-	if err := validateLogging(cfg.Telemetry.Logging); err != nil {
 		return nil, err
 	}
 	if err := validateBackendIDs(cfg.Backends); err != nil {
@@ -326,44 +324,6 @@ func validateAuth(auth Auth) error {
 	}
 	if len(auth.Tokens) == 0 {
 		return errors.New("auth.tokens: at least one token is required when auth.enabled is true")
-	}
-	return nil
-}
-
-// validateTelemetry rejects an explicitly out-of-range port instead of
-// letting it silently reach net.Listen and fail there with a less useful
-// error; an unset port is left alone (applyDefaults fills it in whenever
-// metrics are enabled).
-func validateTelemetry(t Telemetry) error {
-	if !t.Metrics.Enabled {
-		return nil
-	}
-	if t.Metrics.Port < 0 || t.Metrics.Port > 65535 {
-		return fmt.Errorf("telemetry.metrics.port: must be between 0 and 65535, got %d", t.Metrics.Port)
-	}
-	if t.Metrics.Path != "" && !strings.HasPrefix(t.Metrics.Path, "/") {
-		return fmt.Errorf("telemetry.metrics.path: must start with %q, got %q", "/", t.Metrics.Path)
-	}
-	return nil
-}
-
-// validLogLevels/Formats are the only values telemetry.logging.level/format
-// accept, per spec.md §7's comment on the field ("debug, info, warn, error"
-// / "json, text").
-var (
-	validLogLevels  = map[string]bool{"debug": true, "info": true, "warn": true, "error": true}
-	validLogFormats = map[string]bool{"json": true, "text": true}
-)
-
-// validateLogging rejects a level/format outside spec.md §7's documented
-// set, so a typo (e.g. "warning" instead of "warn") fails loudly at load
-// time instead of silently falling back to logging/New's own default.
-func validateLogging(l Logging) error {
-	if !validLogLevels[l.Level] {
-		return fmt.Errorf("telemetry.logging.level: unsupported level %q, must be one of debug/info/warn/error", l.Level)
-	}
-	if !validLogFormats[l.Format] {
-		return fmt.Errorf("telemetry.logging.format: unsupported format %q, must be one of json/text", l.Format)
 	}
 	return nil
 }
@@ -411,28 +371,20 @@ func validateBackendIDs(backends []Backend) error {
 	return nil
 }
 
-// validatePolicies checks that every policy's tool_pattern is a well-formed
-// glob per path.Match's syntax, so a malformed pattern is rejected here, at
-// load time, rather than silently never matching (or erroring) on the first
-// request that reaches policy.Resolver.Resolve. path.Match's error depends
-// only on the pattern, not the name being matched against, so matching
-// against "" is enough to surface a syntax error.
+// validatePolicies checks what checker's struct-tag-driven CheckStruct pass
+// can't: that every policy's tool_pattern is a well-formed glob per
+// path.Match's syntax (path.Match's error depends only on the pattern, not
+// the name being matched against, so matching against "" is enough to
+// surface a syntax error), and that the two config fields no shipped
+// FEATURE ever wired up — resilience.timeout and validation: (see their own
+// doc comments) — are left unset, rather than accepted and silently
+// ignored. Neither rejection fits a checker tag: eq's string-only
+// comparison would panic on Timeout's Duration/int64 kind, and there's no
+// "must be the zero value" checker for a whole struct like Validation.
 func validatePolicies(policies []Policy) error {
 	for _, p := range policies {
 		if _, err := path.Match(p.ToolPattern, ""); err != nil {
 			return fmt.Errorf("policy %q: invalid tool_pattern: %w", p.ToolPattern, err)
-		}
-		if err := validateCircuitBreaker(p.Resilience.CircuitBreaker); err != nil {
-			return fmt.Errorf("policy %q: %w", p.ToolPattern, err)
-		}
-		if err := validateRetries(p.Resilience.Retries); err != nil {
-			return fmt.Errorf("policy %q: %w", p.ToolPattern, err)
-		}
-		if err := validateRateLimit(p.Resilience.RateLimit); err != nil {
-			return fmt.Errorf("policy %q: %w", p.ToolPattern, err)
-		}
-		if p.Resilience.MinDeadlineThreshold < 0 {
-			return fmt.Errorf("policy %q: resilience.min_deadline_threshold: must not be negative", p.ToolPattern)
 		}
 		if p.Resilience.Timeout != 0 {
 			return fmt.Errorf("policy %q: resilience.timeout: not supported in v1 (use min_deadline_threshold)", p.ToolPattern)
@@ -444,67 +396,9 @@ func validatePolicies(policies []Policy) error {
 	return nil
 }
 
-// validateCircuitBreaker rejects an explicit, out-of-range value instead of
-// letting it silently fall back to resile's own circuit.New default (e.g. a
-// negative or >100 failure_rate quietly becomes 50.0) — a config mistake
-// should fail loudly at startup, not produce an unexplained default in
-// production. A zero value is left alone: it means "unset, use resile's
-// default", the same convention Server's timeout/byte-size fields use.
-func validateCircuitBreaker(cb *CircuitBreaker) error {
-	if cb == nil {
-		return nil
-	}
-	if cb.FailureRate < 0 || cb.FailureRate > 100 {
-		return fmt.Errorf("circuit_breaker.failure_rate: must be between 0 and 100, got %v", cb.FailureRate)
-	}
-	if cb.WindowDuration < 0 {
-		return fmt.Errorf("circuit_breaker.window_duration: must not be negative")
-	}
-	if cb.ResetTimeout < 0 {
-		return fmt.Errorf("circuit_breaker.reset_timeout: must not be negative")
-	}
-	return nil
-}
-
-// validateRetries checks fields left after applyDefaults has already filled
-// in the zero ones, so what's left to reject is only an explicit mistake: a
-// negative delay, or a backoff other than the one resile currently supports.
-func validateRetries(r *Retries) error {
-	if r == nil {
-		return nil
-	}
-	if r.BaseDelay < 0 {
-		return fmt.Errorf("retries.base_delay: must not be negative")
-	}
-	if r.MaxDelay < 0 {
-		return fmt.Errorf("retries.max_delay: must not be negative")
-	}
-	if r.Backoff != backoffFullJitter {
-		return fmt.Errorf("retries.backoff: unsupported backoff %q, only %q is supported in v1", r.Backoff, backoffFullJitter)
-	}
-	return nil
-}
-
-// validateRateLimit requires both fields whenever rate_limit: is present:
-// unlike the other resilience blocks, there's no zero value that means
-// "unset, use a sensible default" here — resile.NewRateLimiter(0, x) simply
-// rejects every request, and interval 0 divides by zero internally.
-func validateRateLimit(rl *RateLimit) error {
-	if rl == nil {
-		return nil
-	}
-	if rl.Rate <= 0 {
-		return fmt.Errorf("rate_limit.rate: must be greater than 0, got %v", rl.Rate)
-	}
-	if rl.Interval <= 0 {
-		return fmt.Errorf("rate_limit.interval: must be greater than 0")
-	}
-	return nil
-}
-
 // applyDefaults fills in optional fields left unset in the YAML, before
 // validation runs, so an omitted transport or timeout is never mistaken for
-// an invalid one. It also means the min:1 checkers on the timeout/byte-size
+// an invalid one. It also means the gte:1 checkers on the timeout/byte-size
 // fields only ever see the zero value as "unset, now defaulted", never as
 // "explicitly zero" — an explicit negative value is what they catch.
 func (c *Config) applyDefaults() {
@@ -568,20 +462,4 @@ func (c *Config) applyDefaults() {
 			r.Backoff = backoffFullJitter
 		}
 	}
-}
-
-// checkerError flattens a checker.Errors map into a single, deterministic
-// error message, with each field name prefixed for context.
-func checkerError(prefix string, errs checker.Errors) error {
-	names := make([]string, 0, len(errs))
-	for name := range errs {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-
-	msgs := make([]string, len(names))
-	for i, name := range names {
-		msgs[i] = fmt.Sprintf("%s%s: %v", prefix, name, errs[name])
-	}
-	return errors.New(strings.Join(msgs, "; "))
 }

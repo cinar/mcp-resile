@@ -464,6 +464,30 @@ func TestParseNoPolicies(t *testing.T) {
 	}
 }
 
+// TestParseExplicitEmptyBackendsListIsRejected proves an explicitly empty
+// "backends: []" is rejected exactly like an omitted backends: key, not
+// silently accepted. This is worth its own test, not just a TestParseErrors
+// table row: checker v2's required checker is IsZero-based, and
+// reflect.Value.IsZero() on a slice only reports true for a nil slice — an
+// explicit "[]" unmarshals to a non-nil, zero-length slice, so a naive
+// `checkers:"@required"` tag would NOT catch this case. Backends is tagged
+// `@min-len:1` instead specifically because MinLen compares len(), which is
+// 0 either way.
+func TestParseExplicitEmptyBackendsListIsRejected(t *testing.T) {
+	yaml := `
+server:
+  listen: "0.0.0.0:8080"
+backends: []
+`
+	_, err := config.Parse([]byte(yaml))
+	if err == nil {
+		t.Fatal("Parse: got nil error for an explicitly empty backends: [] list")
+	}
+	if !strings.Contains(err.Error(), "Backends:") {
+		t.Errorf("Parse error = %q, want it to name the Backends field", err.Error())
+	}
+}
+
 func TestParseErrors(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -478,7 +502,7 @@ backends:
   - id: "svc"
     url: "http://svc.internal/mcp"
 `,
-			wantErr: "Server.Listen: is required",
+			wantErr: "Server.Listen:",
 		},
 		{
 			name: "unsupported server transport",
@@ -490,7 +514,7 @@ backends:
   - id: "svc"
     url: "http://svc.internal/mcp"
 `,
-			wantErr: "Server.Transport: unsupported transport",
+			wantErr: "Server.Transport:",
 		},
 		{
 			name: "no backends",
@@ -499,7 +523,7 @@ server:
   listen: "0.0.0.0:8080"
 backends: []
 `,
-			wantErr: "Backends: is required",
+			wantErr: "Backends:",
 		},
 		{
 			name: "two backends missing prefix",
@@ -538,7 +562,7 @@ server:
 backends:
   - url: "http://svc.internal/mcp"
 `,
-			wantErr: "Backends[0].ID: is required",
+			wantErr: "Backends[0].ID:",
 		},
 		{
 			name: "missing backend url",
@@ -548,7 +572,7 @@ server:
 backends:
   - id: "svc"
 `,
-			wantErr: "Backends[0].URL: is required",
+			wantErr: "Backends[0].URL:",
 		},
 		{
 			name: "invalid backend url",
@@ -571,7 +595,7 @@ backends:
     url: "http://svc.internal/mcp"
     transport: "stdio"
 `,
-			wantErr: "Backends[0].Transport: unsupported transport",
+			wantErr: "Backends[0].Transport:",
 		},
 		{
 			name: "negative read timeout",
@@ -625,7 +649,7 @@ backends:
 policies:
   - tool_pattern: ""
 `,
-			wantErr: "Policies[0].ToolPattern: is required",
+			wantErr: "Policies[0].ToolPattern:",
 		},
 		{
 			name: "malformed policy glob",
@@ -654,7 +678,7 @@ policies:
       circuit_breaker:
         failure_rate: 150
 `,
-			wantErr: "circuit_breaker.failure_rate: must be between 0 and 100",
+			wantErr: "Policies[0].Resilience.CircuitBreaker.FailureRate:",
 		},
 		{
 			name: "circuit breaker negative window_duration",
@@ -670,7 +694,7 @@ policies:
       circuit_breaker:
         window_duration: "-1s"
 `,
-			wantErr: "circuit_breaker.window_duration: must not be negative",
+			wantErr: "Policies[0].Resilience.CircuitBreaker.WindowDuration:",
 		},
 		{
 			name: "retries negative base_delay",
@@ -686,7 +710,7 @@ policies:
       retries:
         base_delay: "-150ms"
 `,
-			wantErr: "retries.base_delay: must not be negative",
+			wantErr: "Policies[0].Resilience.Retries.BaseDelay:",
 		},
 		{
 			name: "retries unsupported backoff",
@@ -702,7 +726,7 @@ policies:
       retries:
         backoff: "exponential"
 `,
-			wantErr: `retries.backoff: unsupported backoff "exponential"`,
+			wantErr: "Policies[0].Resilience.Retries.Backoff:",
 		},
 		{
 			name: "rate limit missing rate",
@@ -718,7 +742,7 @@ policies:
       rate_limit:
         interval: "1s"
 `,
-			wantErr: "rate_limit.rate: must be greater than 0",
+			wantErr: "Policies[0].Resilience.RateLimit.Rate:",
 		},
 		{
 			name: "rate limit missing interval",
@@ -734,7 +758,7 @@ policies:
       rate_limit:
         rate: 100.0
 `,
-			wantErr: "rate_limit.interval: must be greater than 0",
+			wantErr: "Policies[0].Resilience.RateLimit.Interval:",
 		},
 		{
 			name: "negative min_deadline_threshold",
@@ -749,7 +773,7 @@ policies:
     resilience:
       min_deadline_threshold: "-1s"
 `,
-			wantErr: "resilience.min_deadline_threshold: must not be negative",
+			wantErr: "Policies[0].Resilience.MinDeadlineThreshold:",
 		},
 		{
 			name: "auth enabled with no tokens",
@@ -777,7 +801,7 @@ backends:
   - id: "svc"
     url: "http://svc.internal/mcp"
 `,
-			wantErr: "telemetry.metrics.port: must be between 0 and 65535",
+			wantErr: "Telemetry.Metrics.Port:",
 		},
 		{
 			name: "metrics enabled with path missing leading slash",
@@ -792,7 +816,7 @@ backends:
   - id: "svc"
     url: "http://svc.internal/mcp"
 `,
-			wantErr: `telemetry.metrics.path: must start with "/"`,
+			wantErr: "Telemetry.Metrics.Path:",
 		},
 		{
 			name: "unsupported log level",
@@ -806,7 +830,7 @@ backends:
   - id: "svc"
     url: "http://svc.internal/mcp"
 `,
-			wantErr: `telemetry.logging.level: unsupported level "warning"`,
+			wantErr: "Telemetry.Logging.Level:",
 		},
 		{
 			name: "unsupported log format",
@@ -820,7 +844,7 @@ backends:
   - id: "svc"
     url: "http://svc.internal/mcp"
 `,
-			wantErr: `telemetry.logging.format: unsupported format "yaml"`,
+			wantErr: "Telemetry.Logging.Format:",
 		},
 		{
 			name: "unknown top-level field",
