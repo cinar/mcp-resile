@@ -229,6 +229,32 @@ func TestRateLimiterSharedAcrossCalls(t *testing.T) {
 	}
 }
 
+// BenchmarkResolve measures the "policy match" stage of the hot path
+// (spec.md §12 FEATURE-023: "validate → policy match → resile pipeline →
+// dispatch"): resolving a tool name against a realistic list of policies —
+// several non-matching glob patterns before the one that actually matches,
+// so the benchmark reflects path.Match's real cost across the list rather
+// than a best-case single-policy resolver.
+func BenchmarkResolve(b *testing.B) {
+	r := policy.NewResolver([]config.Policy{
+		{ToolPattern: "http_*"},
+		{ToolPattern: "search_*"},
+		{ToolPattern: "cache_*"},
+		{ToolPattern: "db_read_*", Resilience: config.Resilience{
+			CircuitBreaker: &config.CircuitBreaker{FailureRate: 50, WindowDuration: config.Duration(30 * time.Second)},
+			RateLimit:      &config.RateLimit{Rate: 1000, Interval: config.Duration(time.Second)},
+		}},
+		{ToolPattern: "db_write_*"},
+	})
+
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if _, ok := r.Resolve("db_read_users"); !ok {
+			b.Fatal("Resolve should have matched db_read_*")
+		}
+	}
+}
+
 var errBackend = errBackendError{}
 
 type errBackendError struct{}

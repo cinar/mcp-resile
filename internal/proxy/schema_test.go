@@ -127,6 +127,26 @@ func TestValidateArgumentsEmptyArgumentsIsAnEmptyObject(t *testing.T) {
 	}
 }
 
+// BenchmarkValidateArguments measures the "validate" stage of the hot path
+// (spec.md §12 FEATURE-023: "validate → policy match → resile pipeline →
+// dispatch"), against an already-compiled/cached schema — the case every
+// tools/call after the first hits, per schemaCache's whole point
+// (FEATURE-017).
+func BenchmarkValidateArguments(b *testing.B) {
+	resolved, err := compileSchema(textSchema(true))
+	if err != nil {
+		b.Fatalf("compileSchema: %v", err)
+	}
+	args := json.RawMessage(`{"text":"hello, world"}`)
+
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if err := validateArguments(resolved, "echo", args); err != nil {
+			b.Fatalf("validateArguments: %v", err)
+		}
+	}
+}
+
 func assertInvalidParams(t *testing.T, err error, wantTool string) {
 	t.Helper()
 
