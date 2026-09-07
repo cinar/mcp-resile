@@ -4,6 +4,7 @@ go 1.25.0
 
 require (
 	github.com/cinar/checker v1.4.1
+	github.com/cinar/resile v1.0.6
 	github.com/modelcontextprotocol/go-sdk v1.7.0
 	gopkg.in/yaml.v3 v3.0.1
 )

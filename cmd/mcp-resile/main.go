@@ -13,6 +13,7 @@ import (
 	"github.com/cinar/mcp-resile/internal/config"
 	"github.com/cinar/mcp-resile/internal/egress"
 	"github.com/cinar/mcp-resile/internal/ingress"
+	"github.com/cinar/mcp-resile/internal/policy"
 	"github.com/cinar/mcp-resile/internal/proxy"
 	"github.com/cinar/mcp-resile/internal/version"
 )
@@ -41,9 +42,11 @@ func run(configPath string) error {
 	routes, closeBackends := dialBackends(cfg.Backends, router)
 	defer closeBackends()
 
+	policies := policy.NewResolver(cfg.Policies)
+
 	server := ingress.NewServer(serverName, version.Version, proxy.MergeCapabilities(routes))
 	router.Attach(server)
-	server.AddReceivingMiddleware(proxy.Middleware(routes, router))
+	server.AddReceivingMiddleware(proxy.Middleware(routes, router, policies))
 
 	httpServer := &http.Server{
 		Addr:         cfg.Server.Listen,

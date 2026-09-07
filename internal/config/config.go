@@ -84,12 +84,34 @@ type Backend struct {
 	URL       string `yaml:"url" checkers:"required url"`
 }
 
+// CircuitBreaker is the resilience.circuit_breaker: sub-block of a policy
+// (spec.md §7), mapping directly onto github.com/cinar/resile/circuit.Config
+// (FEATURE-011). A zero value for any field leaves resile's own circuit.New
+// defaults in effect (50% failure rate, 60s window, 60s reset) — checker
+// can't validate these (it only auto-recurses into non-pointer struct
+// fields, and this one is a pointer so config.Policy can tell "circuit
+// breaker omitted" apart from "circuit breaker present with defaults"), so
+// validateCircuitBreaker checks them by hand.
+type CircuitBreaker struct {
+	FailureRate    float64  `yaml:"failure_rate"`
+	WindowDuration Duration `yaml:"window_duration"`
+	ResetTimeout   Duration `yaml:"reset_timeout"`
+}
+
+// Resilience is the resilience: sub-block of a policy (spec.md §7). Later
+// features (FEATURE-012 onward) add retries/rate_limit/timeout as they
+// start consuming them.
+type Resilience struct {
+	CircuitBreaker *CircuitBreaker `yaml:"circuit_breaker"`
+}
+
 // Policy is one entry of the policies: list (spec.md §7). A tool name is
 // matched against ToolPattern (a path.Match glob) to resolve the policy
-// that governs it, per FEATURE-010. Later features (FEATURE-011 onward)
-// add the validation/resilience fields as they start consuming them.
+// that governs it, per FEATURE-010. Later features add the remaining
+// validation/resilience fields as they start consuming them.
 type Policy struct {
-	ToolPattern string `yaml:"tool_pattern" checkers:"required"`
+	ToolPattern string     `yaml:"tool_pattern" checkers:"required"`
+	Resilience  Resilience `yaml:"resilience"`
 }
 
 // Config is the top-level mcp-resile.yaml document.
@@ -185,6 +207,31 @@ func validatePolicies(policies []Policy) error {
 		if _, err := path.Match(p.ToolPattern, ""); err != nil {
 			return fmt.Errorf("policy %q: invalid tool_pattern: %w", p.ToolPattern, err)
 		}
+		if err := validateCircuitBreaker(p.Resilience.CircuitBreaker); err != nil {
+			return fmt.Errorf("policy %q: %w", p.ToolPattern, err)
+		}
+	}
+	return nil
+}
+
+// validateCircuitBreaker rejects an explicit, out-of-range value instead of
+// letting it silently fall back to resile's own circuit.New default (e.g. a
+// negative or >100 failure_rate quietly becomes 50.0) — a config mistake
+// should fail loudly at startup, not produce an unexplained default in
+// production. A zero value is left alone: it means "unset, use resile's
+// default", the same convention Server's timeout/byte-size fields use.
+func validateCircuitBreaker(cb *CircuitBreaker) error {
+	if cb == nil {
+		return nil
+	}
+	if cb.FailureRate < 0 || cb.FailureRate > 100 {
+		return fmt.Errorf("circuit_breaker.failure_rate: must be between 0 and 100, got %v", cb.FailureRate)
+	}
+	if cb.WindowDuration < 0 {
+		return fmt.Errorf("circuit_breaker.window_duration: must not be negative")
+	}
+	if cb.ResetTimeout < 0 {
+		return fmt.Errorf("circuit_breaker.reset_timeout: must not be negative")
 	}
 	return nil
 }

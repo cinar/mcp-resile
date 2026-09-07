@@ -4,13 +4,16 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/cinar/mcp-resile/internal/config"
 	"github.com/cinar/mcp-resile/internal/egress"
 	"github.com/cinar/mcp-resile/internal/ingress"
+	"github.com/cinar/mcp-resile/internal/policy"
 	"github.com/cinar/mcp-resile/internal/proxy"
 )
 
@@ -85,14 +88,14 @@ func dialTestBackend(t *testing.T, url string) *egress.Backend {
 // is private to this gateway; tests exercising notification forwarding
 // build their own wiring instead, since that requires sharing one router
 // between the egress.Dial call and the gateway (see
-// newRoutedTestSystem).
-func newTestGateway(t *testing.T, routes []proxy.Route) string {
+// newRoutedTestSystem). policies is optional; most tests have none.
+func newTestGateway(t *testing.T, routes []proxy.Route, policies ...config.Policy) string {
 	t.Helper()
 
 	router := proxy.NewNotificationRouter()
 	server := ingress.NewServer("mcp-resile", "test", proxy.MergeCapabilities(routes))
 	router.Attach(server)
-	server.AddReceivingMiddleware(proxy.Middleware(routes, router))
+	server.AddReceivingMiddleware(proxy.Middleware(routes, router, policy.NewResolver(policies)))
 
 	httpServer := httptest.NewServer(ingress.NewHandler(server))
 	t.Cleanup(httpServer.Close)
@@ -158,7 +161,7 @@ func newRoutedTestSystem(t *testing.T, backendURL string) string {
 	routes := []proxy.Route{{Prefix: "", Backend: backend}}
 	server := ingress.NewServer("mcp-resile", "test", proxy.MergeCapabilities(routes))
 	router.Attach(server)
-	server.AddReceivingMiddleware(proxy.Middleware(routes, router))
+	server.AddReceivingMiddleware(proxy.Middleware(routes, router, policy.NewResolver(nil)))
 
 	httpServer := httptest.NewServer(ingress.NewHandler(server))
 	t.Cleanup(httpServer.Close)
@@ -464,5 +467,39 @@ func TestUnknownToolFallsThrough(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("CallTool: got nil error for an unrouted tool name, want an unknown-tool error")
+	}
+}
+
+// TestCircuitBreakerOpensAfterSustainedFailures proves a policy's circuit
+// breaker actually gates dispatch end-to-end (FEATURE-011): calling a tool
+// name that doesn't exist on the backend fails every time via a real
+// JSON-RPC error, and once the breaker trips, that keeps failing but with
+// the breaker's own error, not the backend's — meaning later calls in the
+// run stopped reaching the backend at all.
+func TestCircuitBreakerOpensAfterSustainedFailures(t *testing.T) {
+	ctx := context.Background()
+	backend := dialTestBackend(t, newTestBackend(t, "echo"))
+	gatewayURL := newTestGateway(t, []proxy.Route{{Prefix: "", Backend: backend}}, config.Policy{
+		ToolPattern: "boom",
+		Resilience: config.Resilience{
+			CircuitBreaker: &config.CircuitBreaker{
+				FailureRate:    50,
+				WindowDuration: config.Duration(time.Minute),
+				ResetTimeout:   config.Duration(time.Minute),
+			},
+		},
+	})
+	session := connect(t, gatewayURL)
+
+	var lastErr error
+	for i := 0; i < 20; i++ {
+		_, lastErr = session.CallTool(ctx, &mcp.CallToolParams{Name: "boom", Arguments: map[string]any{}})
+		if lastErr == nil {
+			t.Fatal("CallTool: got nil error for a tool the backend doesn't expose")
+		}
+	}
+
+	if !strings.Contains(lastErr.Error(), "circuit breaker is open") {
+		t.Errorf("after 20 straight failures, CallTool error = %q, want it to mention the circuit breaker is open", lastErr.Error())
 	}
 }

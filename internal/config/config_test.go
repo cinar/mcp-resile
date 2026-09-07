@@ -126,6 +126,40 @@ policies:
 	}
 }
 
+func TestParsePolicyCircuitBreaker(t *testing.T) {
+	yaml := `
+server:
+  listen: "0.0.0.0:8080"
+backends:
+  - id: "svc"
+    url: "http://svc.internal/mcp"
+policies:
+  - tool_pattern: "db_write_*"
+    resilience:
+      circuit_breaker:
+        failure_rate: 40.0
+        window_duration: "30s"
+        reset_timeout: "15s"
+`
+	cfg, err := config.Parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	cb := cfg.Policies[0].Resilience.CircuitBreaker
+	if cb == nil {
+		t.Fatal("Policies[0].Resilience.CircuitBreaker is nil, want it populated")
+	}
+	if cb.FailureRate != 40.0 {
+		t.Errorf("FailureRate = %v, want 40.0", cb.FailureRate)
+	}
+	if time.Duration(cb.WindowDuration) != 30*time.Second {
+		t.Errorf("WindowDuration = %v, want 30s", time.Duration(cb.WindowDuration))
+	}
+	if time.Duration(cb.ResetTimeout) != 15*time.Second {
+		t.Errorf("ResetTimeout = %v, want 15s", time.Duration(cb.ResetTimeout))
+	}
+}
+
 func TestParseNoPolicies(t *testing.T) {
 	cfg, err := config.Parse([]byte(validYAML))
 	if err != nil {
@@ -311,6 +345,38 @@ policies:
   - tool_pattern: "db_[read_*"
 `,
 			wantErr: "invalid tool_pattern",
+		},
+		{
+			name: "circuit breaker failure_rate out of range",
+			yaml: `
+server:
+  listen: "0.0.0.0:8080"
+backends:
+  - id: "svc"
+    url: "http://svc.internal/mcp"
+policies:
+  - tool_pattern: "db_write_*"
+    resilience:
+      circuit_breaker:
+        failure_rate: 150
+`,
+			wantErr: "circuit_breaker.failure_rate: must be between 0 and 100",
+		},
+		{
+			name: "circuit breaker negative window_duration",
+			yaml: `
+server:
+  listen: "0.0.0.0:8080"
+backends:
+  - id: "svc"
+    url: "http://svc.internal/mcp"
+policies:
+  - tool_pattern: "db_write_*"
+    resilience:
+      circuit_breaker:
+        window_duration: "-1s"
+`,
+			wantErr: "circuit_breaker.window_duration: must not be negative",
 		},
 	}
 
