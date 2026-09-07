@@ -35,6 +35,11 @@ const (
 	defaultMaxRequestBytes  = 1 << 20   // 1 MiB
 	defaultMaxResponseBytes = 512 << 10 // 512 KiB
 
+	// defaultAuthHeader matches spec.md §7's own example; auth.header only
+	// gets defaulted when auth.enabled: is true, since it's meaningless
+	// otherwise.
+	defaultAuthHeader = "Authorization"
+
 	// backoffFullJitter is the only backoff resile currently provides
 	// (resile.NewFullJitter); it's still a named config value, not
 	// hardcoded, since it's what spec.md §7's backoff: field documents.
@@ -153,10 +158,23 @@ type Policy struct {
 	Resilience  Resilience `yaml:"resilience"`
 }
 
+// Auth is the auth: section of the config (spec.md §5.4, §7): a bearer
+// token or API key allow-list checked against one HTTP header on every
+// ingress request, rejecting anything not on the list before it reaches
+// any backend (FEATURE-019). It answers "is this caller allowed to talk to
+// the gateway at all" — not per-tool masking, which is Post-V1 (spec.md
+// §11).
+type Auth struct {
+	Enabled bool     `yaml:"enabled"`
+	Header  string   `yaml:"header"`
+	Tokens  []string `yaml:"tokens"`
+}
+
 // Config is the top-level mcp-resile.yaml document.
 type Config struct {
 	Version  string    `yaml:"version"`
 	Server   Server    `yaml:"server"`
+	Auth     Auth      `yaml:"auth"`
 	Backends []Backend `yaml:"backends" checkers:"required"`
 	Policies []Policy  `yaml:"policies"`
 }
@@ -200,6 +218,9 @@ func Parse(data []byte) (*Config, error) {
 		}
 	}
 
+	if err := validateAuth(cfg.Auth); err != nil {
+		return nil, err
+	}
 	if err := validatePrefixes(cfg.Backends); err != nil {
 		return nil, err
 	}
@@ -208,6 +229,20 @@ func Parse(data []byte) (*Config, error) {
 	}
 
 	return &cfg, nil
+}
+
+// validateAuth requires at least one token whenever auth.enabled: is true —
+// an empty allow-list would reject every single request, which is never
+// what an operator setting enabled: true actually wants, so it fails loudly
+// at load time instead of locking everyone out at runtime.
+func validateAuth(auth Auth) error {
+	if !auth.Enabled {
+		return nil
+	}
+	if len(auth.Tokens) == 0 {
+		return errors.New("auth.tokens: at least one token is required when auth.enabled is true")
+	}
+	return nil
 }
 
 // validatePrefixes enforces spec.md §5.1's namespace conflict resolution:
@@ -337,6 +372,10 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Server.MaxRequestBytes == 0 {
 		c.Server.MaxRequestBytes = defaultMaxRequestBytes
+	}
+
+	if c.Auth.Enabled && c.Auth.Header == "" {
+		c.Auth.Header = defaultAuthHeader
 	}
 	if c.Server.MaxResponseBytes == 0 {
 		c.Server.MaxResponseBytes = defaultMaxResponseBytes

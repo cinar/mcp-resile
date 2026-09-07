@@ -1,6 +1,7 @@
 package config_test
 
 import (
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -302,6 +303,60 @@ policies:
 	}
 }
 
+func TestParseAuthDisabledByDefault(t *testing.T) {
+	cfg, err := config.Parse([]byte(validYAML))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if cfg.Auth.Enabled {
+		t.Error("Auth.Enabled = true, want false (auth: is optional and off by default)")
+	}
+}
+
+func TestParseAuthAppliesDefaultHeader(t *testing.T) {
+	yaml := `
+server:
+  listen: "0.0.0.0:8080"
+auth:
+  enabled: true
+  tokens: ["shared-secret-key-1"]
+backends:
+  - id: "svc"
+    url: "http://svc.internal/mcp"
+`
+	cfg, err := config.Parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if cfg.Auth.Header != "Authorization" {
+		t.Errorf("Auth.Header = %q, want default %q", cfg.Auth.Header, "Authorization")
+	}
+}
+
+func TestParseAuthExplicitHeaderAndTokens(t *testing.T) {
+	yaml := `
+server:
+  listen: "0.0.0.0:8080"
+auth:
+  enabled: true
+  header: "X-API-Key"
+  tokens: ["key-1", "key-2"]
+backends:
+  - id: "svc"
+    url: "http://svc.internal/mcp"
+`
+	cfg, err := config.Parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if cfg.Auth.Header != "X-API-Key" {
+		t.Errorf("Auth.Header = %q, want %q", cfg.Auth.Header, "X-API-Key")
+	}
+	if want := []string{"key-1", "key-2"}; !slices.Equal(cfg.Auth.Tokens, want) {
+		t.Errorf("Auth.Tokens = %v, want %v", cfg.Auth.Tokens, want)
+	}
+}
+
 func TestParseNoPolicies(t *testing.T) {
 	cfg, err := config.Parse([]byte(validYAML))
 	if err != nil {
@@ -598,6 +653,19 @@ policies:
       min_deadline_threshold: "-1s"
 `,
 			wantErr: "resilience.min_deadline_threshold: must not be negative",
+		},
+		{
+			name: "auth enabled with no tokens",
+			yaml: `
+server:
+  listen: "0.0.0.0:8080"
+auth:
+  enabled: true
+backends:
+  - id: "svc"
+    url: "http://svc.internal/mcp"
+`,
+			wantErr: "auth.tokens: at least one token is required when auth.enabled is true",
 		},
 	}
 

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/cinar/mcp-resile/internal/auth"
 	"github.com/cinar/mcp-resile/internal/config"
 	"github.com/cinar/mcp-resile/internal/egress"
 	"github.com/cinar/mcp-resile/internal/ingress"
@@ -50,7 +51,7 @@ func run(configPath string) error {
 
 	httpServer := &http.Server{
 		Addr:         cfg.Server.Listen,
-		Handler:      ingress.NewHandler(server),
+		Handler:      auth.Middleware(cfg.Auth, ingress.NewHandler(server)),
 		ReadTimeout:  time.Duration(cfg.Server.ReadTimeout),
 		WriteTimeout: time.Duration(cfg.Server.WriteTimeout),
 	}
