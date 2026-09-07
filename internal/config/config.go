@@ -78,10 +78,10 @@ func (d *Duration) UnmarshalYAML(value *yaml.Node) error {
 type Server struct {
 	Listen           string   `yaml:"listen" checkers:"required"`
 	Transport        string   `yaml:"transport" checkers:"server-transport"`
-	ReadTimeout      Duration `yaml:"read_timeout"`
-	WriteTimeout     Duration `yaml:"write_timeout"`
-	MaxRequestBytes  int64    `yaml:"max_request_bytes"`
-	MaxResponseBytes int64    `yaml:"max_response_bytes"`
+	ReadTimeout      Duration `yaml:"read_timeout" checkers:"min:1"`
+	WriteTimeout     Duration `yaml:"write_timeout" checkers:"min:1"`
+	MaxRequestBytes  int64    `yaml:"max_request_bytes" checkers:"min:1"`
+	MaxResponseBytes int64    `yaml:"max_response_bytes" checkers:"min:1"`
 }
 
 // Backend is one entry of the backends: list.
@@ -136,7 +136,9 @@ func Parse(data []byte) (*Config, error) {
 
 // applyDefaults fills in optional fields left unset in the YAML, before
 // validation runs, so an omitted transport or timeout is never mistaken for
-// an invalid one.
+// an invalid one. It also means the min:1 checkers on the timeout/byte-size
+// fields only ever see the zero value as "unset, now defaulted", never as
+// "explicitly zero" — an explicit negative value is what they catch.
 func (c *Config) applyDefaults() {
 	if c.Server.Transport == "" {
 		c.Server.Transport = transportStreamableHTTP

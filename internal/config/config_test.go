@@ -173,6 +173,30 @@ backends:
 			wantErr: "Backends[0].Transport: unsupported transport",
 		},
 		{
+			name: "negative read timeout",
+			yaml: `
+server:
+  listen: "0.0.0.0:8080"
+  read_timeout: "-5s"
+backends:
+  - id: "svc"
+    url: "http://svc.internal/mcp"
+`,
+			wantErr: "Server.ReadTimeout",
+		},
+		{
+			name: "negative max request bytes",
+			yaml: `
+server:
+  listen: "0.0.0.0:8080"
+  max_request_bytes: -100
+backends:
+  - id: "svc"
+    url: "http://svc.internal/mcp"
+`,
+			wantErr: "Server.MaxRequestBytes",
+		},
+		{
 			name: "malformed duration",
 			yaml: `
 server:
