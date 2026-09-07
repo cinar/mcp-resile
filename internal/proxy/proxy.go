@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"maps"
 	"strings"
 	"time"
@@ -32,8 +33,12 @@ const (
 
 // Route associates one egress backend with the namespace prefix used to
 // disambiguate its tools from every other backend's. Prefix may be empty
-// only when it is the sole route (config.Load enforces this).
+// only when it is the sole route (config.Load enforces this). ID is the
+// backend's config.Backend.ID, carried through purely for structured
+// logging (FEATURE-021) — egress.Backend itself exposes no identifier of
+// its own.
 type Route struct {
+	ID      string
 	Prefix  string
 	Backend *egress.Backend
 }
@@ -54,7 +59,7 @@ type Route struct {
 // (FEATURE-017), via a schema cache private to this Middleware call, and a
 // successful response's text content is clamped to maxResponseBytes,
 // truncated with a notice appended if it doesn't fit (FEATURE-018).
-func Middleware(routes []Route, router *NotificationRouter, policies *policy.Resolver, maxResponseBytes int64, m *metrics.Metrics) mcp.Middleware {
+func Middleware(routes []Route, router *NotificationRouter, policies *policy.Resolver, maxResponseBytes int64, m *metrics.Metrics, logger *slog.Logger) mcp.Middleware {
 	schemas := newSchemaCache()
 
 	return func(next mcp.MethodHandler) mcp.MethodHandler {
@@ -63,7 +68,7 @@ func Middleware(routes []Route, router *NotificationRouter, policies *policy.Res
 			case methodListTools:
 				return listTools(ctx, routes, schemas)
 			case methodCallTool:
-				return callTool(ctx, routes, req, next, router, policies, schemas, maxResponseBytes, m)
+				return callTool(ctx, routes, req, next, router, policies, schemas, maxResponseBytes, m, logger)
 			default:
 				return next(ctx, method, req)
 			}
@@ -131,7 +136,7 @@ func listTools(ctx context.Context, routes []Route, schemas *schemaCache) (*mcp.
 // response's text content is then clamped to maxResponseBytes, truncated
 // with a notice appended if it doesn't fit (FEATURE-018); this happens
 // after dispatch, unconditionally, regardless of policy match.
-func callTool(ctx context.Context, routes []Route, req mcp.Request, next mcp.MethodHandler, router *NotificationRouter, policies *policy.Resolver, schemas *schemaCache, maxResponseBytes int64, m *metrics.Metrics) (mcp.Result, error) {
+func callTool(ctx context.Context, routes []Route, req mcp.Request, next mcp.MethodHandler, router *NotificationRouter, policies *policy.Resolver, schemas *schemaCache, maxResponseBytes int64, m *metrics.Metrics, logger *slog.Logger) (mcp.Result, error) {
 	params, ok := req.GetParams().(*mcp.CallToolParamsRaw)
 	if !ok {
 		return nil, fmt.Errorf("proxy: unexpected params type %T for %s", req.GetParams(), methodCallTool)
@@ -144,8 +149,40 @@ func callTool(ctx context.Context, routes []Route, req mcp.Request, next mcp.Met
 
 	start := time.Now()
 	result, err := dispatchTool(ctx, route, name, params, req, router, policies, schemas, maxResponseBytes, m)
-	m.RecordRequest(params.Name, outcomeForError(err), time.Since(start))
+	duration := time.Since(start)
+	outcome := outcomeForError(err)
+	m.RecordRequest(params.Name, outcome, duration)
+	logDispatch(ctx, logger, params.Name, route.ID, outcome, duration, err)
 	return result, err
+}
+
+// logDispatch logs one tools/call dispatch's outcome, per the FEATURE-021
+// acceptance criterion: a successful call logs at info with tool name,
+// backend, outcome, and latency; a failed one logs at warn (or error, for a
+// recovered panic — the one outcome that indicates a bug rather than an
+// expected rejection) with the same fields plus the mapped JSON-RPC error
+// code, when the error carries one.
+func logDispatch(ctx context.Context, logger *slog.Logger, tool, backend, outcome string, duration time.Duration, err error) {
+	attrs := []slog.Attr{
+		slog.String("tool", tool),
+		slog.String("backend", backend),
+		slog.String("outcome", outcome),
+		slog.Duration("latency", duration),
+	}
+
+	if err == nil {
+		logger.LogAttrs(ctx, slog.LevelInfo, "tools/call", attrs...)
+		return
+	}
+
+	level := slog.LevelWarn
+	if outcome == outcomeInternalError {
+		level = slog.LevelError
+	}
+	if code, ok := jsonrpcCode(err); ok {
+		attrs = append(attrs, slog.Int64("code", code))
+	}
+	logger.LogAttrs(ctx, level, "tools/call", attrs...)
 }
 
 // dispatchTool does the actual validate-then-dispatch work for one matched

@@ -415,6 +415,43 @@ backends:
 	}
 }
 
+func TestParseLoggingAppliesDefaults(t *testing.T) {
+	cfg, err := config.Parse([]byte(validYAML))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if cfg.Telemetry.Logging.Level != "info" {
+		t.Errorf("Telemetry.Logging.Level = %q, want default %q", cfg.Telemetry.Logging.Level, "info")
+	}
+	if cfg.Telemetry.Logging.Format != "json" {
+		t.Errorf("Telemetry.Logging.Format = %q, want default %q", cfg.Telemetry.Logging.Format, "json")
+	}
+}
+
+func TestParseLoggingExplicitLevelAndFormat(t *testing.T) {
+	yaml := `
+server:
+  listen: "0.0.0.0:8080"
+telemetry:
+  logging:
+    level: "debug"
+    format: "text"
+backends:
+  - id: "svc"
+    url: "http://svc.internal/mcp"
+`
+	cfg, err := config.Parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if cfg.Telemetry.Logging.Level != "debug" {
+		t.Errorf("Telemetry.Logging.Level = %q, want %q", cfg.Telemetry.Logging.Level, "debug")
+	}
+	if cfg.Telemetry.Logging.Format != "text" {
+		t.Errorf("Telemetry.Logging.Format = %q, want %q", cfg.Telemetry.Logging.Format, "text")
+	}
+}
+
 func TestParseNoPolicies(t *testing.T) {
 	cfg, err := config.Parse([]byte(validYAML))
 	if err != nil {
@@ -754,6 +791,34 @@ backends:
     url: "http://svc.internal/mcp"
 `,
 			wantErr: `telemetry.metrics.path: must start with "/"`,
+		},
+		{
+			name: "unsupported log level",
+			yaml: `
+server:
+  listen: "0.0.0.0:8080"
+telemetry:
+  logging:
+    level: "warning"
+backends:
+  - id: "svc"
+    url: "http://svc.internal/mcp"
+`,
+			wantErr: `telemetry.logging.level: unsupported level "warning"`,
+		},
+		{
+			name: "unsupported log format",
+			yaml: `
+server:
+  listen: "0.0.0.0:8080"
+telemetry:
+  logging:
+    format: "yaml"
+backends:
+  - id: "svc"
+    url: "http://svc.internal/mcp"
+`,
+			wantErr: `telemetry.logging.format: unsupported format "yaml"`,
 		},
 	}
 

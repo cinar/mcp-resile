@@ -86,6 +86,13 @@ func mapResilienceError(err error, rl *config.RateLimit) error {
 	}
 }
 
+// outcomeInternalError is outcomeForError's label for a recovered panic —
+// named separately from its other string labels since logDispatch (FEATURE-
+// 021) checks specifically for it to decide warn vs error log level: a
+// recovered panic indicates a bug in mcp-resile or a backend, not an
+// ordinary policy rejection.
+const outcomeInternalError = "internal_error"
+
 // outcomeForError classifies a dispatchTool error into the "outcome" label
 // FEATURE-020's request-count metric groups by, reusing the same
 // mapResilienceError classification rather than re-deriving it — every
@@ -104,7 +111,7 @@ func outcomeForError(err error) string {
 
 	switch {
 	case errors.As(err, &panicErr):
-		return "internal_error"
+		return outcomeInternalError
 	case errors.Is(err, circuit.ErrCircuitOpen):
 		return "circuit_open"
 	case errors.Is(err, resile.ErrRateLimitExceeded):
@@ -116,6 +123,20 @@ func outcomeForError(err error) string {
 	default:
 		return "error"
 	}
+}
+
+// jsonrpcCode extracts the JSON-RPC error code from err, if it (or
+// something it wraps) is a *jsonrpc.Error — true for anything
+// mapResilienceError or schema/auth validation returns, false for a raw
+// backend/transport error that was never mapped to one. Used by
+// logDispatch (FEATURE-021) to attach the code errors are documented to log
+// with.
+func jsonrpcCode(err error) (int64, bool) {
+	var wireErr *jsonrpc.Error
+	if errors.As(err, &wireErr) {
+		return wireErr.Code, true
+	}
+	return 0, false
 }
 
 type circuitOpenData struct {

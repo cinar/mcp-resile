@@ -46,6 +46,12 @@ const (
 	defaultMetricsPort = 9090
 	defaultMetricsPath = "/metrics"
 
+	// defaultLogLevel/Format match spec.md §7's own example. Unlike
+	// metrics/auth, telemetry.logging: has no enabled: switch — the gateway
+	// always logs somewhere, so these are defaulted unconditionally.
+	defaultLogLevel  = "info"
+	defaultLogFormat = "json"
+
 	// backoffFullJitter is the only backoff resile currently provides
 	// (resile.NewFullJitter); it's still a named config value, not
 	// hardcoded, since it's what spec.md §7's backoff: field documents.
@@ -187,9 +193,18 @@ type Metrics struct {
 	Path    string `yaml:"path"`
 }
 
+// Logging is the telemetry.logging: sub-block of the config (spec.md §7),
+// controlling the gateway's structured slog output (FEATURE-021). Level is
+// one of "debug"/"info"/"warn"/"error"; Format is "json" or "text".
+type Logging struct {
+	Level  string `yaml:"level"`
+	Format string `yaml:"format"`
+}
+
 // Telemetry is the telemetry: section of the config (spec.md §7).
 type Telemetry struct {
 	Metrics Metrics `yaml:"metrics"`
+	Logging Logging `yaml:"logging"`
 }
 
 // Config is the top-level mcp-resile.yaml document.
@@ -247,6 +262,9 @@ func Parse(data []byte) (*Config, error) {
 	if err := validateTelemetry(cfg.Telemetry); err != nil {
 		return nil, err
 	}
+	if err := validateLogging(cfg.Telemetry.Logging); err != nil {
+		return nil, err
+	}
 	if err := validatePrefixes(cfg.Backends); err != nil {
 		return nil, err
 	}
@@ -284,6 +302,27 @@ func validateTelemetry(t Telemetry) error {
 	}
 	if t.Metrics.Path != "" && !strings.HasPrefix(t.Metrics.Path, "/") {
 		return fmt.Errorf("telemetry.metrics.path: must start with %q, got %q", "/", t.Metrics.Path)
+	}
+	return nil
+}
+
+// validLogLevels/Formats are the only values telemetry.logging.level/format
+// accept, per spec.md §7's comment on the field ("debug, info, warn, error"
+// / "json, text").
+var (
+	validLogLevels  = map[string]bool{"debug": true, "info": true, "warn": true, "error": true}
+	validLogFormats = map[string]bool{"json": true, "text": true}
+)
+
+// validateLogging rejects a level/format outside spec.md §7's documented
+// set, so a typo (e.g. "warning" instead of "warn") fails loudly at load
+// time instead of silently falling back to logging/New's own default.
+func validateLogging(l Logging) error {
+	if !validLogLevels[l.Level] {
+		return fmt.Errorf("telemetry.logging.level: unsupported level %q, must be one of debug/info/warn/error", l.Level)
+	}
+	if !validLogFormats[l.Format] {
+		return fmt.Errorf("telemetry.logging.format: unsupported format %q, must be one of json/text", l.Format)
 	}
 	return nil
 }
@@ -428,6 +467,13 @@ func (c *Config) applyDefaults() {
 		if c.Telemetry.Metrics.Path == "" {
 			c.Telemetry.Metrics.Path = defaultMetricsPath
 		}
+	}
+
+	if c.Telemetry.Logging.Level == "" {
+		c.Telemetry.Logging.Level = defaultLogLevel
+	}
+	if c.Telemetry.Logging.Format == "" {
+		c.Telemetry.Logging.Format = defaultLogFormat
 	}
 	if c.Server.MaxResponseBytes == 0 {
 		c.Server.MaxResponseBytes = defaultMaxResponseBytes

@@ -14,6 +14,7 @@ import (
 	"github.com/cinar/mcp-resile/internal/config"
 	"github.com/cinar/mcp-resile/internal/egress"
 	"github.com/cinar/mcp-resile/internal/ingress"
+	"github.com/cinar/mcp-resile/internal/logging"
 	"github.com/cinar/mcp-resile/internal/metrics"
 	"github.com/cinar/mcp-resile/internal/policy"
 	"github.com/cinar/mcp-resile/internal/proxy"
@@ -56,9 +57,11 @@ func run(configPath string) error {
 		serveMetrics(cfg.Telemetry.Metrics, m)
 	}
 
+	logger := logging.New(cfg.Telemetry.Logging)
+
 	server := ingress.NewServer(serverName, version.Version, proxy.MergeCapabilities(routes))
 	router.Attach(server)
-	server.AddReceivingMiddleware(proxy.Middleware(routes, router, policies, cfg.Server.MaxResponseBytes, m))
+	server.AddReceivingMiddleware(proxy.Middleware(routes, router, policies, cfg.Server.MaxResponseBytes, m, logger))
 
 	httpServer := &http.Server{
 		Addr:         cfg.Server.Listen,
@@ -115,7 +118,7 @@ func dialBackends(backends []config.Backend, router *proxy.NotificationRouter) (
 		}
 
 		dialed = append(dialed, backend)
-		routes = append(routes, proxy.Route{Prefix: backendCfg.Prefix, Backend: backend})
+		routes = append(routes, proxy.Route{ID: backendCfg.ID, Prefix: backendCfg.Prefix, Backend: backend})
 	}
 
 	return routes, closeAll

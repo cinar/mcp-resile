@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httputil"
@@ -25,6 +26,12 @@ import (
 	"github.com/cinar/mcp-resile/internal/policy"
 	"github.com/cinar/mcp-resile/internal/proxy"
 )
+
+// discardLogger is the *slog.Logger every test gateway dispatches through:
+// tests assert on the JSON-RPC response and, where FEATURE-020/021 are
+// specifically under test, on metrics/log output captured separately —
+// nothing here needs stray log lines cluttering `go test -v` output.
+var discardLogger = slog.New(slog.NewTextHandler(io.Discard, nil))
 
 // scrapeMetrics renders m's Prometheus exposition format as a string, so
 // tests can assert on it directly rather than reaching into unexported
@@ -243,7 +250,7 @@ func newTestGatewayWithMaxResponseBytes(t *testing.T, routes []proxy.Route, maxR
 	router := proxy.NewNotificationRouter()
 	server := ingress.NewServer("mcp-resile", "test", proxy.MergeCapabilities(routes))
 	router.Attach(server)
-	server.AddReceivingMiddleware(proxy.Middleware(routes, router, policy.NewResolver(policies), maxResponseBytes, metrics.New()))
+	server.AddReceivingMiddleware(proxy.Middleware(routes, router, policy.NewResolver(policies), maxResponseBytes, metrics.New(), discardLogger))
 
 	httpServer := httptest.NewServer(ingress.NewHandler(server))
 	t.Cleanup(httpServer.Close)
@@ -262,12 +269,29 @@ func newTestGatewayWithMetrics(t *testing.T, routes []proxy.Route, policies ...c
 	router := proxy.NewNotificationRouter()
 	server := ingress.NewServer("mcp-resile", "test", proxy.MergeCapabilities(routes))
 	router.Attach(server)
-	server.AddReceivingMiddleware(proxy.Middleware(routes, router, policy.NewResolver(policies), defaultTestMaxResponseBytes, m))
+	server.AddReceivingMiddleware(proxy.Middleware(routes, router, policy.NewResolver(policies), defaultTestMaxResponseBytes, m, discardLogger))
 
 	httpServer := httptest.NewServer(ingress.NewHandler(server))
 	t.Cleanup(httpServer.Close)
 
 	return httpServer.URL, m
+}
+
+// newTestGatewayWithLogger is newTestGateway, but dispatches through logger
+// instead of discardLogger, for tests asserting on FEATURE-021's request
+// log output.
+func newTestGatewayWithLogger(t *testing.T, routes []proxy.Route, logger *slog.Logger) string {
+	t.Helper()
+
+	router := proxy.NewNotificationRouter()
+	server := ingress.NewServer("mcp-resile", "test", proxy.MergeCapabilities(routes))
+	router.Attach(server)
+	server.AddReceivingMiddleware(proxy.Middleware(routes, router, policy.NewResolver(nil), defaultTestMaxResponseBytes, metrics.New(), logger))
+
+	httpServer := httptest.NewServer(ingress.NewHandler(server))
+	t.Cleanup(httpServer.Close)
+
+	return httpServer.URL
 }
 
 type notifyInput struct {
@@ -328,7 +352,7 @@ func newRoutedTestSystem(t *testing.T, backendURL string) string {
 	routes := []proxy.Route{{Prefix: "", Backend: backend}}
 	server := ingress.NewServer("mcp-resile", "test", proxy.MergeCapabilities(routes))
 	router.Attach(server)
-	server.AddReceivingMiddleware(proxy.Middleware(routes, router, policy.NewResolver(nil), defaultTestMaxResponseBytes, metrics.New()))
+	server.AddReceivingMiddleware(proxy.Middleware(routes, router, policy.NewResolver(nil), defaultTestMaxResponseBytes, metrics.New(), discardLogger))
 
 	httpServer := httptest.NewServer(ingress.NewHandler(server))
 	t.Cleanup(httpServer.Close)
@@ -972,5 +996,79 @@ func TestMetricsRecordedForRealDispatch(t *testing.T) {
 	}
 	if !strings.Contains(body, `mcp_resile_request_duration_seconds_count{tool="echo"} 2`) {
 		t.Errorf("missing/wrong latency observation count in:\n%s", body)
+	}
+}
+
+// TestRequestLoggingSuccessAtInfo proves the FEATURE-021 acceptance
+// criterion's success path: a successful tools/call logs one line at info
+// carrying the tool name, backend, outcome, and latency as structured
+// fields.
+func TestRequestLoggingSuccessAtInfo(t *testing.T) {
+	ctx := context.Background()
+	backendURL := newTestBackend(t, "echo")
+	backend := dialTestBackend(t, backendURL)
+
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+	gatewayURL := newTestGatewayWithLogger(t, []proxy.Route{{ID: "svc-a", Prefix: "", Backend: backend}}, logger)
+	session := connect(t, gatewayURL)
+
+	if _, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "echo", Arguments: map[string]any{"text": "hi"}}); err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+
+	var line map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(buf.Bytes()), &line); err != nil {
+		t.Fatalf("log output %q did not parse as a single JSON line: %v", buf.String(), err)
+	}
+	if line["level"] != "INFO" {
+		t.Errorf(`line["level"] = %v, want "INFO"`, line["level"])
+	}
+	if line["tool"] != "echo" {
+		t.Errorf(`line["tool"] = %v, want "echo"`, line["tool"])
+	}
+	if line["backend"] != "svc-a" {
+		t.Errorf(`line["backend"] = %v, want "svc-a"`, line["backend"])
+	}
+	if line["outcome"] != "success" {
+		t.Errorf(`line["outcome"] = %v, want "success"`, line["outcome"])
+	}
+	if _, ok := line["latency"]; !ok {
+		t.Error(`line missing "latency"`)
+	}
+	if _, ok := line["code"]; ok {
+		t.Error(`line has "code", want it absent for a successful call`)
+	}
+}
+
+// TestRequestLoggingErrorAtWarnWithCode proves the FEATURE-021 acceptance
+// criterion's error path: a rejected tools/call logs at warn, carrying the
+// mapped JSON-RPC code (here -32602, from FEATURE-017's schema validation).
+func TestRequestLoggingErrorAtWarnWithCode(t *testing.T) {
+	ctx := context.Background()
+	backendURL := newTestBackend(t, "echo")
+	backend := dialTestBackend(t, backendURL)
+
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+	gatewayURL := newTestGatewayWithLogger(t, []proxy.Route{{Prefix: "", Backend: backend}}, logger)
+	session := connect(t, gatewayURL)
+
+	if _, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "echo", Arguments: map[string]any{}}); err == nil {
+		t.Fatal("CallTool with missing required argument succeeded, want a schema-validation error")
+	}
+
+	var line map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(buf.Bytes()), &line); err != nil {
+		t.Fatalf("log output %q did not parse as a single JSON line: %v", buf.String(), err)
+	}
+	if line["level"] != "WARN" {
+		t.Errorf(`line["level"] = %v, want "WARN"`, line["level"])
+	}
+	if line["outcome"] != "invalid_params" {
+		t.Errorf(`line["outcome"] = %v, want "invalid_params"`, line["outcome"])
+	}
+	if code, ok := line["code"].(float64); !ok || int64(code) != -32602 {
+		t.Errorf(`line["code"] = %v, want -32602`, line["code"])
 	}
 }
