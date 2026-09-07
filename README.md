@@ -140,6 +140,16 @@ telemetry:
 
 ## Running with Docker
 
+A prebuilt image is published to GitHub Container Registry on every `vX.Y.Z` tag:
+
+```sh
+docker run -p 8080:8080 \
+  -v "$(pwd)/mcp-resile.yaml:/etc/mcp-resile/mcp-resile.yaml:ro" \
+  ghcr.io/cinar/mcp-resile:latest
+```
+
+Or build it yourself:
+
 ```sh
 docker build -t mcp-resile .
 docker run -p 8080:8080 \
@@ -147,7 +157,7 @@ docker run -p 8080:8080 \
   mcp-resile
 ```
 
-The image is built on `gcr.io/distroless/static:nonroot` — no shell, no package manager, runs as a non-root user. Pass `--build-arg VERSION=$(git describe --tags --always --dirty)` to stamp a real version into the binary; it defaults to `dev`.
+The image is built on `gcr.io/distroless/static:nonroot` — no shell, no package manager, runs as a non-root user — and published for both `linux/amd64` and `linux/arm64`. Pass `--build-arg VERSION=$(git describe --tags --always --dirty)` to stamp a real version into a locally built image; it defaults to `dev`.
 
 ## Configuration Reference
 
