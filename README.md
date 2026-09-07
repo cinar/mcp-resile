@@ -195,6 +195,8 @@ make lint    # go vet, plus golangci-lint if installed
 
 See [BENCHMARKS.md](BENCHMARKS.md) for measured (not estimated) performance numbers for the hot path.
 
+[![mcp-resile MCP server — quality and maintenance score on Glama](https://glama.ai/mcp/servers/cinar/mcp-resile/badges/score.svg)](https://glama.ai/mcp/servers/cinar/mcp-resile)
+
 ## Contributing to the Project
 
 Issues and pull requests are welcome. If you're proposing a larger change, please open an issue first so the approach can be discussed before you put in the work.
