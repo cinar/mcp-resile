@@ -40,6 +40,12 @@ const (
 	// otherwise.
 	defaultAuthHeader = "Authorization"
 
+	// defaultMetricsPort/Path match spec.md §7's own example; like
+	// auth.header, they're only defaulted when telemetry.metrics.enabled:
+	// is true.
+	defaultMetricsPort = 9090
+	defaultMetricsPath = "/metrics"
+
 	// backoffFullJitter is the only backoff resile currently provides
 	// (resile.NewFullJitter); it's still a named config value, not
 	// hardcoded, since it's what spec.md §7's backoff: field documents.
@@ -170,13 +176,30 @@ type Auth struct {
 	Tokens  []string `yaml:"tokens"`
 }
 
+// Metrics is the telemetry.metrics: sub-block of the config (spec.md §7),
+// controlling the Prometheus /metrics endpoint (FEATURE-020). It's served on
+// its own listener (Port), separate from server.listen, so a scraper never
+// competes with MCP traffic for the same port or routes. Disabled by
+// default, like Auth.
+type Metrics struct {
+	Enabled bool   `yaml:"enabled"`
+	Port    int    `yaml:"port"`
+	Path    string `yaml:"path"`
+}
+
+// Telemetry is the telemetry: section of the config (spec.md §7).
+type Telemetry struct {
+	Metrics Metrics `yaml:"metrics"`
+}
+
 // Config is the top-level mcp-resile.yaml document.
 type Config struct {
-	Version  string    `yaml:"version"`
-	Server   Server    `yaml:"server"`
-	Auth     Auth      `yaml:"auth"`
-	Backends []Backend `yaml:"backends" checkers:"required"`
-	Policies []Policy  `yaml:"policies"`
+	Version   string    `yaml:"version"`
+	Server    Server    `yaml:"server"`
+	Auth      Auth      `yaml:"auth"`
+	Telemetry Telemetry `yaml:"telemetry"`
+	Backends  []Backend `yaml:"backends" checkers:"required"`
+	Policies  []Policy  `yaml:"policies"`
 }
 
 // Load reads and validates the config file at path.
@@ -221,6 +244,9 @@ func Parse(data []byte) (*Config, error) {
 	if err := validateAuth(cfg.Auth); err != nil {
 		return nil, err
 	}
+	if err := validateTelemetry(cfg.Telemetry); err != nil {
+		return nil, err
+	}
 	if err := validatePrefixes(cfg.Backends); err != nil {
 		return nil, err
 	}
@@ -241,6 +267,23 @@ func validateAuth(auth Auth) error {
 	}
 	if len(auth.Tokens) == 0 {
 		return errors.New("auth.tokens: at least one token is required when auth.enabled is true")
+	}
+	return nil
+}
+
+// validateTelemetry rejects an explicitly out-of-range port instead of
+// letting it silently reach net.Listen and fail there with a less useful
+// error; an unset port is left alone (applyDefaults fills it in whenever
+// metrics are enabled).
+func validateTelemetry(t Telemetry) error {
+	if !t.Metrics.Enabled {
+		return nil
+	}
+	if t.Metrics.Port < 0 || t.Metrics.Port > 65535 {
+		return fmt.Errorf("telemetry.metrics.port: must be between 0 and 65535, got %d", t.Metrics.Port)
+	}
+	if t.Metrics.Path != "" && !strings.HasPrefix(t.Metrics.Path, "/") {
+		return fmt.Errorf("telemetry.metrics.path: must start with %q, got %q", "/", t.Metrics.Path)
 	}
 	return nil
 }
@@ -376,6 +419,15 @@ func (c *Config) applyDefaults() {
 
 	if c.Auth.Enabled && c.Auth.Header == "" {
 		c.Auth.Header = defaultAuthHeader
+	}
+
+	if c.Telemetry.Metrics.Enabled {
+		if c.Telemetry.Metrics.Port == 0 {
+			c.Telemetry.Metrics.Port = defaultMetricsPort
+		}
+		if c.Telemetry.Metrics.Path == "" {
+			c.Telemetry.Metrics.Path = defaultMetricsPath
+		}
 	}
 	if c.Server.MaxResponseBytes == 0 {
 		c.Server.MaxResponseBytes = defaultMaxResponseBytes

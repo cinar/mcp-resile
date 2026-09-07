@@ -86,6 +86,38 @@ func mapResilienceError(err error, rl *config.RateLimit) error {
 	}
 }
 
+// outcomeForError classifies a dispatchTool error into the "outcome" label
+// FEATURE-020's request-count metric groups by, reusing the same
+// mapResilienceError classification rather than re-deriving it — every
+// value here corresponds 1:1 with one of mapResilienceError's cases, plus
+// "success" and a catch-all "error" for anything mapResilienceError leaves
+// unmapped (a backend's own application error, a disconnected client, or
+// this dispatch's own -32602 from schema validation, which never reaches
+// mapResilienceError at all since it's returned before resile.Do runs).
+func outcomeForError(err error) string {
+	if err == nil {
+		return "success"
+	}
+
+	var panicErr *resile.PanicError
+	var wireErr *jsonrpc.Error
+
+	switch {
+	case errors.As(err, &panicErr):
+		return "internal_error"
+	case errors.Is(err, circuit.ErrCircuitOpen):
+		return "circuit_open"
+	case errors.Is(err, resile.ErrRateLimitExceeded):
+		return "rate_limited"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "timeout"
+	case errors.As(err, &wireErr) && wireErr.Code == codeInvalidParams:
+		return "invalid_params"
+	default:
+		return "error"
+	}
+}
+
 type circuitOpenData struct {
 	Reason string `json:"reason"`
 }

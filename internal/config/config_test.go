@@ -357,6 +357,64 @@ backends:
 	}
 }
 
+func TestParseMetricsDisabledByDefault(t *testing.T) {
+	cfg, err := config.Parse([]byte(validYAML))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if cfg.Telemetry.Metrics.Enabled {
+		t.Error("Telemetry.Metrics.Enabled = true, want false (telemetry.metrics: is optional and off by default)")
+	}
+}
+
+func TestParseMetricsAppliesDefaultPortAndPath(t *testing.T) {
+	yaml := `
+server:
+  listen: "0.0.0.0:8080"
+telemetry:
+  metrics:
+    enabled: true
+backends:
+  - id: "svc"
+    url: "http://svc.internal/mcp"
+`
+	cfg, err := config.Parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if cfg.Telemetry.Metrics.Port != 9090 {
+		t.Errorf("Telemetry.Metrics.Port = %d, want default 9090", cfg.Telemetry.Metrics.Port)
+	}
+	if cfg.Telemetry.Metrics.Path != "/metrics" {
+		t.Errorf("Telemetry.Metrics.Path = %q, want default %q", cfg.Telemetry.Metrics.Path, "/metrics")
+	}
+}
+
+func TestParseMetricsExplicitPortAndPath(t *testing.T) {
+	yaml := `
+server:
+  listen: "0.0.0.0:8080"
+telemetry:
+  metrics:
+    enabled: true
+    port: 9999
+    path: "/internal/metrics"
+backends:
+  - id: "svc"
+    url: "http://svc.internal/mcp"
+`
+	cfg, err := config.Parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if cfg.Telemetry.Metrics.Port != 9999 {
+		t.Errorf("Telemetry.Metrics.Port = %d, want 9999", cfg.Telemetry.Metrics.Port)
+	}
+	if cfg.Telemetry.Metrics.Path != "/internal/metrics" {
+		t.Errorf("Telemetry.Metrics.Path = %q, want %q", cfg.Telemetry.Metrics.Path, "/internal/metrics")
+	}
+}
+
 func TestParseNoPolicies(t *testing.T) {
 	cfg, err := config.Parse([]byte(validYAML))
 	if err != nil {
@@ -666,6 +724,36 @@ backends:
     url: "http://svc.internal/mcp"
 `,
 			wantErr: "auth.tokens: at least one token is required when auth.enabled is true",
+		},
+		{
+			name: "metrics enabled with out-of-range port",
+			yaml: `
+server:
+  listen: "0.0.0.0:8080"
+telemetry:
+  metrics:
+    enabled: true
+    port: 99999
+backends:
+  - id: "svc"
+    url: "http://svc.internal/mcp"
+`,
+			wantErr: "telemetry.metrics.port: must be between 0 and 65535",
+		},
+		{
+			name: "metrics enabled with path missing leading slash",
+			yaml: `
+server:
+  listen: "0.0.0.0:8080"
+telemetry:
+  metrics:
+    enabled: true
+    path: "metrics"
+backends:
+  - id: "svc"
+    url: "http://svc.internal/mcp"
+`,
+			wantErr: `telemetry.metrics.path: must start with "/"`,
 		},
 	}
 

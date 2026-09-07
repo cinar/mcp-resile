@@ -14,6 +14,7 @@ import (
 	"github.com/cinar/mcp-resile/internal/config"
 	"github.com/cinar/mcp-resile/internal/egress"
 	"github.com/cinar/mcp-resile/internal/ingress"
+	"github.com/cinar/mcp-resile/internal/metrics"
 	"github.com/cinar/mcp-resile/internal/policy"
 	"github.com/cinar/mcp-resile/internal/proxy"
 	"github.com/cinar/mcp-resile/internal/version"
@@ -45,9 +46,19 @@ func run(configPath string) error {
 
 	policies := policy.NewResolver(cfg.Policies)
 
+	m := metrics.New()
+	for _, p := range policies.Policies() {
+		if cb := p.CircuitBreaker(); cb != nil {
+			m.WatchCircuitBreaker(p.ToolPattern, cb)
+		}
+	}
+	if cfg.Telemetry.Metrics.Enabled {
+		serveMetrics(cfg.Telemetry.Metrics, m)
+	}
+
 	server := ingress.NewServer(serverName, version.Version, proxy.MergeCapabilities(routes))
 	router.Attach(server)
-	server.AddReceivingMiddleware(proxy.Middleware(routes, router, policies, cfg.Server.MaxResponseBytes))
+	server.AddReceivingMiddleware(proxy.Middleware(routes, router, policies, cfg.Server.MaxResponseBytes, m))
 
 	httpServer := &http.Server{
 		Addr:         cfg.Server.Listen,
@@ -58,6 +69,25 @@ func run(configPath string) error {
 
 	log.Printf("mcp-resile %s listening on %s, proxying to %d backend(s)", version.Version, cfg.Server.Listen, len(cfg.Backends))
 	return httpServer.ListenAndServe()
+}
+
+// serveMetrics starts the Prometheus /metrics endpoint on its own listener
+// (telemetry.metrics.port), separate from the gateway's own server.listen,
+// so scraping never competes with MCP traffic for the same port or routes
+// (FEATURE-020). It runs in the background; a failure here logs but doesn't
+// abort startup, matching dialBackends' own "one down piece shouldn't take
+// the rest down" approach.
+func serveMetrics(cfg config.Metrics, m *metrics.Metrics) {
+	mux := http.NewServeMux()
+	mux.Handle(cfg.Path, m.Handler())
+
+	addr := fmt.Sprintf(":%d", cfg.Port)
+	go func() {
+		log.Printf("metrics listening on %s%s", addr, cfg.Path)
+		if err := http.ListenAndServe(addr, mux); err != nil {
+			log.Printf("metrics server stopped: %v", err)
+		}
+	}()
 }
 
 // dialBackends opens an egress session to every configured backend that is

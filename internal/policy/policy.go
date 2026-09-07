@@ -87,6 +87,14 @@ func NewResolver(policies []config.Policy) *Resolver {
 	return &Resolver{policies: built}
 }
 
+// Policies returns every policy the Resolver was built from, in config
+// order. Used by callers that need to walk every policy up front — e.g.
+// wiring a circuit breaker's state changes into metrics (FEATURE-020) —
+// rather than only ever seeing the one Resolve returns for a given call.
+func (r *Resolver) Policies() []*Policy {
+	return r.policies
+}
+
 // Resolve returns the first policy in config order whose tool_pattern
 // matches toolName, and true. If none matches — including when no policies
 // are configured at all — it returns nil and false: the documented default

@@ -10,6 +10,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 
 	"github.com/cinar/mcp-resile/internal/config"
+	"github.com/cinar/mcp-resile/internal/metrics"
 	"github.com/cinar/mcp-resile/internal/policy"
 )
 
@@ -45,7 +46,7 @@ func TestMinDeadlineThresholdAbortsBeforeDispatch(t *testing.T) {
 		return &struct{}{}, nil
 	}
 
-	_, err := resile.Do(ctx, dispatch, resilienceOptions(p)...)
+	_, err := resile.Do(ctx, dispatch, resilienceOptions(p, "db_read_users", metrics.New())...)
 	if dispatched {
 		t.Error("dispatch ran despite the remaining deadline being below min_deadline_threshold")
 	}
@@ -79,7 +80,7 @@ func TestMinDeadlineThresholdUnconfiguredDoesNotAbort(t *testing.T) {
 		return &struct{}{}, nil
 	}
 
-	if _, err := resile.Do(ctx, dispatch, resilienceOptions(p)...); err != nil {
+	if _, err := resile.Do(ctx, dispatch, resilienceOptions(p, "db_read_users", metrics.New())...); err != nil {
 		t.Fatalf("resile.Do: %v, want it to succeed", err)
 	}
 	if !dispatched {
@@ -107,7 +108,7 @@ func TestPanicRecoveryReturnsCleanError(t *testing.T) {
 		panic("simulated panic inside dispatch")
 	}
 
-	_, err := resile.Do(context.Background(), dispatch, baseResilienceOptions...)
+	_, err := resile.Do(context.Background(), dispatch, baseResilienceOptions("db_read_users", metrics.New())...)
 	if err == nil {
 		t.Fatal("resile.Do returned nil error for a panicking dispatch")
 	}

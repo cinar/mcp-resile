@@ -21,9 +21,26 @@ import (
 	"github.com/cinar/mcp-resile/internal/config"
 	"github.com/cinar/mcp-resile/internal/egress"
 	"github.com/cinar/mcp-resile/internal/ingress"
+	"github.com/cinar/mcp-resile/internal/metrics"
 	"github.com/cinar/mcp-resile/internal/policy"
 	"github.com/cinar/mcp-resile/internal/proxy"
 )
+
+// scrapeMetrics renders m's Prometheus exposition format as a string, so
+// tests can assert on it directly rather than reaching into unexported
+// collector state.
+func scrapeMetrics(t *testing.T, m *metrics.Metrics) string {
+	t.Helper()
+
+	rec := httptest.NewRecorder()
+	m.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+
+	body, err := io.ReadAll(rec.Result().Body)
+	if err != nil {
+		t.Fatalf("reading /metrics response: %v", err)
+	}
+	return string(body)
+}
 
 type echoInput struct {
 	Text string `json:"text" jsonschema:"text to echo back"`
@@ -226,12 +243,31 @@ func newTestGatewayWithMaxResponseBytes(t *testing.T, routes []proxy.Route, maxR
 	router := proxy.NewNotificationRouter()
 	server := ingress.NewServer("mcp-resile", "test", proxy.MergeCapabilities(routes))
 	router.Attach(server)
-	server.AddReceivingMiddleware(proxy.Middleware(routes, router, policy.NewResolver(policies), maxResponseBytes))
+	server.AddReceivingMiddleware(proxy.Middleware(routes, router, policy.NewResolver(policies), maxResponseBytes, metrics.New()))
 
 	httpServer := httptest.NewServer(ingress.NewHandler(server))
 	t.Cleanup(httpServer.Close)
 
 	return httpServer.URL
+}
+
+// newTestGatewayWithMetrics is newTestGateway, but also returns the
+// *metrics.Metrics instance wired into the gateway's Middleware, for tests
+// that assert on FEATURE-020's recorded metrics rather than just the
+// JSON-RPC response.
+func newTestGatewayWithMetrics(t *testing.T, routes []proxy.Route, policies ...config.Policy) (string, *metrics.Metrics) {
+	t.Helper()
+
+	m := metrics.New()
+	router := proxy.NewNotificationRouter()
+	server := ingress.NewServer("mcp-resile", "test", proxy.MergeCapabilities(routes))
+	router.Attach(server)
+	server.AddReceivingMiddleware(proxy.Middleware(routes, router, policy.NewResolver(policies), defaultTestMaxResponseBytes, m))
+
+	httpServer := httptest.NewServer(ingress.NewHandler(server))
+	t.Cleanup(httpServer.Close)
+
+	return httpServer.URL, m
 }
 
 type notifyInput struct {
@@ -292,7 +328,7 @@ func newRoutedTestSystem(t *testing.T, backendURL string) string {
 	routes := []proxy.Route{{Prefix: "", Backend: backend}}
 	server := ingress.NewServer("mcp-resile", "test", proxy.MergeCapabilities(routes))
 	router.Attach(server)
-	server.AddReceivingMiddleware(proxy.Middleware(routes, router, policy.NewResolver(nil), defaultTestMaxResponseBytes))
+	server.AddReceivingMiddleware(proxy.Middleware(routes, router, policy.NewResolver(nil), defaultTestMaxResponseBytes, metrics.New()))
 
 	httpServer := httptest.NewServer(ingress.NewHandler(server))
 	t.Cleanup(httpServer.Close)
@@ -903,5 +939,38 @@ func TestResponseClampingTruncatesOversizedBackendResult(t *testing.T) {
 	}
 	if totalText >= len(big) {
 		t.Errorf("total text content = %d bytes, want it well under the original %d-byte response", totalText, len(big))
+	}
+}
+
+// TestMetricsRecordedForRealDispatch proves FEATURE-020's request
+// count/latency metrics are actually wired into a real tools/call dispatch,
+// for both a successful call and a schema-validation rejection (which never
+// reaches resile.Do), not just the metrics package's own unit tests.
+func TestMetricsRecordedForRealDispatch(t *testing.T) {
+	ctx := context.Background()
+	backendURL := newTestBackend(t, "echo")
+	backend := dialTestBackend(t, backendURL)
+	gatewayURL, m := newTestGatewayWithMetrics(t, []proxy.Route{{Prefix: "", Backend: backend}})
+	session := connect(t, gatewayURL)
+
+	if _, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "echo", Arguments: map[string]any{"text": "hi"}}); err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+
+	// "text" is required by echo's inputSchema (see newTestBackend); omitting
+	// it triggers FEATURE-017's -32602 rejection before resile.Do ever runs.
+	if _, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "echo", Arguments: map[string]any{}}); err == nil {
+		t.Fatal("CallTool with missing required argument succeeded, want a schema-validation error")
+	}
+
+	body := scrapeMetrics(t, m)
+	if !strings.Contains(body, `mcp_resile_requests_total{outcome="success",tool="echo"} 1`) {
+		t.Errorf("missing/wrong success count in:\n%s", body)
+	}
+	if !strings.Contains(body, `mcp_resile_requests_total{outcome="invalid_params",tool="echo"} 1`) {
+		t.Errorf("missing/wrong invalid_params count in:\n%s", body)
+	}
+	if !strings.Contains(body, `mcp_resile_request_duration_seconds_count{tool="echo"} 2`) {
+		t.Errorf("missing/wrong latency observation count in:\n%s", body)
 	}
 }

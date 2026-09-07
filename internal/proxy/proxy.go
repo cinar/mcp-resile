@@ -19,6 +19,7 @@ import (
 
 	"github.com/cinar/mcp-resile/internal/config"
 	"github.com/cinar/mcp-resile/internal/egress"
+	"github.com/cinar/mcp-resile/internal/metrics"
 	"github.com/cinar/mcp-resile/internal/policy"
 )
 
@@ -53,7 +54,7 @@ type Route struct {
 // (FEATURE-017), via a schema cache private to this Middleware call, and a
 // successful response's text content is clamped to maxResponseBytes,
 // truncated with a notice appended if it doesn't fit (FEATURE-018).
-func Middleware(routes []Route, router *NotificationRouter, policies *policy.Resolver, maxResponseBytes int64) mcp.Middleware {
+func Middleware(routes []Route, router *NotificationRouter, policies *policy.Resolver, maxResponseBytes int64, m *metrics.Metrics) mcp.Middleware {
 	schemas := newSchemaCache()
 
 	return func(next mcp.MethodHandler) mcp.MethodHandler {
@@ -62,7 +63,7 @@ func Middleware(routes []Route, router *NotificationRouter, policies *policy.Res
 			case methodListTools:
 				return listTools(ctx, routes, schemas)
 			case methodCallTool:
-				return callTool(ctx, routes, req, next, router, policies, schemas, maxResponseBytes)
+				return callTool(ctx, routes, req, next, router, policies, schemas, maxResponseBytes, m)
 			default:
 				return next(ctx, method, req)
 			}
@@ -130,7 +131,7 @@ func listTools(ctx context.Context, routes []Route, schemas *schemaCache) (*mcp.
 // response's text content is then clamped to maxResponseBytes, truncated
 // with a notice appended if it doesn't fit (FEATURE-018); this happens
 // after dispatch, unconditionally, regardless of policy match.
-func callTool(ctx context.Context, routes []Route, req mcp.Request, next mcp.MethodHandler, router *NotificationRouter, policies *policy.Resolver, schemas *schemaCache, maxResponseBytes int64) (mcp.Result, error) {
+func callTool(ctx context.Context, routes []Route, req mcp.Request, next mcp.MethodHandler, router *NotificationRouter, policies *policy.Resolver, schemas *schemaCache, maxResponseBytes int64, m *metrics.Metrics) (mcp.Result, error) {
 	params, ok := req.GetParams().(*mcp.CallToolParamsRaw)
 	if !ok {
 		return nil, fmt.Errorf("proxy: unexpected params type %T for %s", req.GetParams(), methodCallTool)
@@ -141,6 +142,18 @@ func callTool(ctx context.Context, routes []Route, req mcp.Request, next mcp.Met
 		return next(ctx, methodCallTool, req)
 	}
 
+	start := time.Now()
+	result, err := dispatchTool(ctx, route, name, params, req, router, policies, schemas, maxResponseBytes, m)
+	m.RecordRequest(params.Name, outcomeForError(err), time.Since(start))
+	return result, err
+}
+
+// dispatchTool does the actual validate-then-dispatch work for one matched
+// tools/call, once callTool has already resolved which route it belongs to.
+// Split out from callTool so callTool's single RecordRequest call at the end
+// covers every return path here uniformly, including the schema-validation
+// rejection.
+func dispatchTool(ctx context.Context, route Route, name string, params *mcp.CallToolParamsRaw, req mcp.Request, router *NotificationRouter, policies *policy.Resolver, schemas *schemaCache, maxResponseBytes int64, m *metrics.Metrics) (mcp.Result, error) {
 	forwarded := &mcp.CallToolParams{
 		Meta:      maps.Clone(params.Meta),
 		Name:      name,
@@ -167,9 +180,9 @@ func callTool(ctx context.Context, routes []Route, req mcp.Request, next mcp.Met
 
 	p, matched := policies.Resolve(name)
 
-	opts := baseResilienceOptions
+	opts := baseResilienceOptions(params.Name, m)
 	if matched {
-		opts = resilienceOptions(p)
+		opts = resilienceOptions(p, params.Name, m)
 	}
 
 	result, err := resile.Do(ctx, dispatch, opts...)
@@ -184,13 +197,19 @@ func callTool(ctx context.Context, routes []Route, req mcp.Request, next mcp.Met
 }
 
 // baseResilienceOptions is what a tool name matching no policy dispatches
-// with: panic recovery only, one attempt, no deadline threshold. It's what
-// resilienceOptions itself also starts from — kept as its own value so both
-// paths build the same baseline the same way.
-var baseResilienceOptions = []resile.Option{
-	resile.WithPanicRecovery(),
-	resile.WithMaxAttempts(1),
-	resile.WithMinDeadlineThreshold(0),
+// with: panic recovery only, one attempt, no deadline threshold, plus
+// metrics instrumentation. It's what resilienceOptions itself also starts
+// from — kept as its own function so both paths build the same baseline the
+// same way. name is the full (prefixed) tool name, used to label the
+// resulting metrics (FEATURE-020) via resile.WithName/RetryState.Name.
+func baseResilienceOptions(name string, m *metrics.Metrics) []resile.Option {
+	return []resile.Option{
+		resile.WithName(name),
+		resile.WithInstrumenter(m.Instrumenter()),
+		resile.WithPanicRecovery(),
+		resile.WithMaxAttempts(1),
+		resile.WithMinDeadlineThreshold(0),
+	}
 }
 
 // resilienceOptions builds the resile.Options a policy's dispatch should run
@@ -205,8 +224,10 @@ var baseResilienceOptions = []resile.Option{
 // an unconfigured policy into that default the moment a caller's ctx
 // happens to carry a deadline. Threshold 0 only aborts a request whose
 // deadline has already passed, which is what "unconfigured" should mean.
-func resilienceOptions(p *policy.Policy) []resile.Option {
+func resilienceOptions(p *policy.Policy, name string, m *metrics.Metrics) []resile.Option {
 	opts := []resile.Option{
+		resile.WithName(name),
+		resile.WithInstrumenter(m.Instrumenter()),
 		resile.WithPanicRecovery(),
 		resile.WithMinDeadlineThreshold(time.Duration(p.Resilience.MinDeadlineThreshold)),
 	}
