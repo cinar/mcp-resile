@@ -21,21 +21,36 @@ const (
 	codeRateLimitExceeded = -33001
 	codeCircuitOpen       = -33002
 	codeExecutionTimeout  = -33003
+
+	// codeInternalError is JSON-RPC 2.0's own standard "Internal error"
+	// code, not one of mcp-resile's -33000-and-below codes: a recovered
+	// panic (FEATURE-016) isn't a resile policy rejection, it's exactly
+	// what -32603 exists for.
+	codeInternalError = -32603
 )
 
 // mapResilienceError translates an error out of resile.Do's policy pipeline
 // into the exact code/message/payload spec.md §6 defines for it, so a
-// circuit-open, rate-limit, or timeout/min-deadline-threshold rejection
-// reaches the client as a structured, LLM-actionable error rather than a
-// generic internal one. rl is the rate limit configured on the policy that
-// produced err, if any — used to compute retry_after_ms, since
+// circuit-open, rate-limit, timeout/min-deadline-threshold, or recovered
+// panic rejection reaches the client as a clean, structured error rather
+// than an unmapped one leaking internal detail (a *resile.PanicError's
+// Error() is a full stack trace). rl is the rate limit configured on the
+// policy that produced err, if any — used to compute retry_after_ms, since
 // resile.RateLimiter itself exposes no such value.
 //
 // Any other error — the dispatch's own error once retries are exhausted, or
 // context.Canceled from a disconnected client — is returned unchanged: it
 // isn't a resile policy rejection, so §6's mapping doesn't apply to it.
 func mapResilienceError(err error, rl *config.RateLimit) error {
+	var panicErr *resile.PanicError
+
 	switch {
+	case errors.As(err, &panicErr):
+		return &jsonrpc.Error{
+			Code:    codeInternalError,
+			Message: "Internal error",
+		}
+
 	case errors.Is(err, circuit.ErrCircuitOpen):
 		return &jsonrpc.Error{
 			Code:    codeCircuitOpen,

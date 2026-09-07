@@ -132,12 +132,16 @@ type RateLimit struct {
 	Interval Duration `yaml:"interval"`
 }
 
-// Resilience is the resilience: sub-block of a policy (spec.md §7). Later
-// features add timeout as they start consuming it.
+// Resilience is the resilience: sub-block of a policy (spec.md §7).
+// MinDeadlineThreshold maps onto resile.WithMinDeadlineThreshold
+// (FEATURE-015): a scalar duration, not a pointer sub-block like the others,
+// so its zero value means "unconfigured" directly — proxy.resilienceOptions
+// passes it to resile as-is either way (see its doc comment for why).
 type Resilience struct {
-	CircuitBreaker *CircuitBreaker `yaml:"circuit_breaker"`
-	Retries        *Retries        `yaml:"retries"`
-	RateLimit      *RateLimit      `yaml:"rate_limit"`
+	CircuitBreaker       *CircuitBreaker `yaml:"circuit_breaker"`
+	Retries              *Retries        `yaml:"retries"`
+	RateLimit            *RateLimit      `yaml:"rate_limit"`
+	MinDeadlineThreshold Duration        `yaml:"min_deadline_threshold"`
 }
 
 // Policy is one entry of the policies: list (spec.md §7). A tool name is
@@ -250,6 +254,9 @@ func validatePolicies(policies []Policy) error {
 		}
 		if err := validateRateLimit(p.Resilience.RateLimit); err != nil {
 			return fmt.Errorf("policy %q: %w", p.ToolPattern, err)
+		}
+		if p.Resilience.MinDeadlineThreshold < 0 {
+			return fmt.Errorf("policy %q: resilience.min_deadline_threshold: must not be negative", p.ToolPattern)
 		}
 	}
 	return nil

@@ -262,6 +262,46 @@ policies:
 	}
 }
 
+func TestParsePolicyMinDeadlineThreshold(t *testing.T) {
+	yaml := `
+server:
+  listen: "0.0.0.0:8080"
+backends:
+  - id: "svc"
+    url: "http://svc.internal/mcp"
+policies:
+  - tool_pattern: "db_read_*"
+    resilience:
+      min_deadline_threshold: "50ms"
+`
+	cfg, err := config.Parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if got := time.Duration(cfg.Policies[0].Resilience.MinDeadlineThreshold); got != 50*time.Millisecond {
+		t.Errorf("MinDeadlineThreshold = %v, want 50ms", got)
+	}
+}
+
+func TestParsePolicyMinDeadlineThresholdUnsetIsZero(t *testing.T) {
+	yaml := `
+server:
+  listen: "0.0.0.0:8080"
+backends:
+  - id: "svc"
+    url: "http://svc.internal/mcp"
+policies:
+  - tool_pattern: "db_read_*"
+`
+	cfg, err := config.Parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if got := cfg.Policies[0].Resilience.MinDeadlineThreshold; got != 0 {
+		t.Errorf("MinDeadlineThreshold = %v, want 0 (unconfigured)", time.Duration(got))
+	}
+}
+
 func TestParseNoPolicies(t *testing.T) {
 	cfg, err := config.Parse([]byte(validYAML))
 	if err != nil {
@@ -543,6 +583,21 @@ policies:
         rate: 100.0
 `,
 			wantErr: "rate_limit.interval: must be greater than 0",
+		},
+		{
+			name: "negative min_deadline_threshold",
+			yaml: `
+server:
+  listen: "0.0.0.0:8080"
+backends:
+  - id: "svc"
+    url: "http://svc.internal/mcp"
+policies:
+  - tool_pattern: "db_read_*"
+    resilience:
+      min_deadline_threshold: "-1s"
+`,
+			wantErr: "resilience.min_deadline_threshold: must not be negative",
 		},
 	}
 

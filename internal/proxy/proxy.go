@@ -1,7 +1,9 @@
 // Package proxy wires the ingress MCP server to one or more egress
 // backends, merging tools/list across them and routing tools/call by
-// namespace prefix, per spec.md §5.1. No resilience or firewall logic
-// lives here yet, that arrives with FEATURE-010 onward.
+// namespace prefix, per spec.md §5.1, and dispatching each tools/call
+// through resile's resilience primitives per the policy governing it
+// (FEATURE-010 onward). Schema firewall and output guardrail logic lives
+// elsewhere, added by their own features.
 package proxy
 
 import (
@@ -15,6 +17,7 @@ import (
 	"github.com/cinar/resile"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/cinar/mcp-resile/internal/config"
 	"github.com/cinar/mcp-resile/internal/egress"
 	"github.com/cinar/mcp-resile/internal/policy"
 )
@@ -87,14 +90,20 @@ func listTools(ctx context.Context, routes []Route) (*mcp.ListToolsResult, error
 // token, it's swapped for one that identifies this call uniquely to router
 // before forwarding, so a resulting notifications/progress from the backend
 // can be routed back to the calling client and restored to its own token.
-// The (unprefixed) tool name is resolved against policies; a match with a
-// circuit breaker, retries, and/or a rate limit configured dispatches
-// through resile (FEATURE-011, FEATURE-012, FEATURE-013), so sustained
-// backend failures make subsequent calls fail fast, transient ones get
-// retried with full-jitter backoff, and excess calls are shed before
-// reaching the backend. Any resulting circuit-open, rate-limit, or timeout
-// error is mapped to its documented JSON-RPC code (FEATURE-014) rather than
-// reaching the client as a generic internal error.
+// Every dispatch to a backend — matched by a policy or not — runs through
+// resile.Do with at least panic recovery enabled (FEATURE-016), so a panic
+// inside the backend call or its response deserializer never crashes the
+// gateway process; it comes back as a clean internal error instead. The
+// (unprefixed) tool name is also resolved against policies; a match with a
+// circuit breaker, retries, a rate limit, and/or a min-deadline threshold
+// configured folds those into the same resile.Do call (FEATURE-011,
+// FEATURE-012, FEATURE-013, FEATURE-015), so sustained backend failures
+// make subsequent calls fail fast, transient ones get retried with
+// full-jitter backoff, excess calls are shed before reaching the backend,
+// and a request too close to its deadline is aborted before a wasted round
+// trip. Any resulting circuit-open, rate-limit, timeout, or panic error is
+// mapped to its documented JSON-RPC code (FEATURE-014) rather than reaching
+// the client as a generic internal error.
 func callTool(ctx context.Context, routes []Route, req mcp.Request, next mcp.MethodHandler, router *NotificationRouter, policies *policy.Resolver) (mcp.Result, error) {
 	params, ok := req.GetParams().(*mcp.CallToolParamsRaw)
 	if !ok {
@@ -124,35 +133,51 @@ func callTool(ctx context.Context, routes []Route, req mcp.Request, next mcp.Met
 		return route.Backend.CallTool(ctx, forwarded)
 	}
 
-	p, ok := policies.Resolve(name)
-	if !ok {
-		return dispatch(ctx)
-	}
+	p, matched := policies.Resolve(name)
 
-	opts := resilienceOptions(p)
-	if len(opts) == 0 {
-		// No circuit breaker, retries, or rate limit configured for this
-		// policy: dispatch directly rather than through an "empty"
-		// resile.Do, which would otherwise silently inherit
-		// resile.DefaultConfig's own defaults (e.g. a 5ms
-		// MinDeadlineThreshold) ahead of FEATURE-015 wiring it up on
-		// purpose.
-		return dispatch(ctx)
+	opts := baseResilienceOptions
+	if matched {
+		opts = resilienceOptions(p)
 	}
 
 	result, err := resile.Do(ctx, dispatch, opts...)
 	if err != nil {
-		return nil, mapResilienceError(err, p.Resilience.RateLimit)
+		var rateLimit *config.RateLimit
+		if matched {
+			rateLimit = p.Resilience.RateLimit
+		}
+		return nil, mapResilienceError(err, rateLimit)
 	}
 	return result, nil
 }
 
+// baseResilienceOptions is what a tool name matching no policy dispatches
+// with: panic recovery only, one attempt, no deadline threshold. It's what
+// resilienceOptions itself also starts from — kept as its own value so both
+// paths build the same baseline the same way.
+var baseResilienceOptions = []resile.Option{
+	resile.WithPanicRecovery(),
+	resile.WithMaxAttempts(1),
+	resile.WithMinDeadlineThreshold(0),
+}
+
 // resilienceOptions builds the resile.Options a policy's dispatch should run
-// with. A circuit breaker, retries, and a rate limit can all be configured
-// on the same policy and combine into one resile.Do call, matching
-// spec.md §8's ToolExecutionEngine example.
+// with. A circuit breaker, retries, a rate limit, and a min-deadline
+// threshold can all be configured on the same policy and combine into one
+// resile.Do call, matching spec.md §8's ToolExecutionEngine example.
+//
+// WithMinDeadlineThreshold is always passed, even when
+// resilience.min_deadline_threshold: is unset (Duration's zero value):
+// every resile.Do call starts from resile.DefaultConfig(), which sets its
+// own 5ms threshold, so leaving the option off entirely would silently opt
+// an unconfigured policy into that default the moment a caller's ctx
+// happens to carry a deadline. Threshold 0 only aborts a request whose
+// deadline has already passed, which is what "unconfigured" should mean.
 func resilienceOptions(p *policy.Policy) []resile.Option {
-	var opts []resile.Option
+	opts := []resile.Option{
+		resile.WithPanicRecovery(),
+		resile.WithMinDeadlineThreshold(time.Duration(p.Resilience.MinDeadlineThreshold)),
+	}
 
 	if cb := p.CircuitBreaker(); cb != nil {
 		opts = append(opts, resile.WithCircuitBreaker(cb))
@@ -168,10 +193,9 @@ func resilienceOptions(p *policy.Policy) []resile.Option {
 			resile.WithBackoff(resile.NewFullJitter(time.Duration(r.BaseDelay), time.Duration(r.MaxDelay))),
 			resile.WithRetryIfFunc(isTransientError),
 		)
-	} else if len(opts) > 0 {
-		// A circuit breaker and/or rate limit but no retries: pin attempts
-		// to 1. resile.Do
-		// otherwise defaults to 5 attempts with full-jitter backoff
+	} else {
+		// No retries configured: pin attempts to 1. resile.Do otherwise
+		// defaults to 5 attempts with full-jitter backoff
 		// (resile.DefaultConfig), which would silently retry on this
 		// policy's behalf without it having asked for that.
 		opts = append(opts, resile.WithMaxAttempts(1))

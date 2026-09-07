@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -64,6 +65,13 @@ func TestMapResilienceError(t *testing.T) {
 			wantData:    map[string]any{"hint": "narrow the request scope or retry later"},
 		},
 		{
+			name:        "recovered panic",
+			err:         fmt.Errorf("dispatch: %w", &resile.PanicError{Value: "boom", StackTrace: "goroutine 1 [running]:\n...secret internal detail..."}),
+			wantCode:    codeInternalError,
+			wantMessage: "Internal error",
+			wantData:    nil,
+		},
+		{
 			name:     "context canceled passes through unchanged",
 			err:      context.Canceled,
 			wantSame: true,
@@ -96,6 +104,16 @@ func TestMapResilienceError(t *testing.T) {
 			}
 			if rpcErr.Message != tc.wantMessage {
 				t.Errorf("Message = %q, want %q", rpcErr.Message, tc.wantMessage)
+			}
+			if strings.Contains(rpcErr.Message, "secret internal detail") {
+				t.Error("Message leaked the panic's raw stack trace")
+			}
+
+			if tc.wantData == nil {
+				if len(rpcErr.Data) != 0 {
+					t.Errorf("Data = %s, want none", rpcErr.Data)
+				}
+				return
 			}
 
 			var data map[string]any
