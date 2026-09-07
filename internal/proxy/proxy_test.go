@@ -128,6 +128,43 @@ func newFlakyBackend(t *testing.T, toolName string, failCount int) (backendURL s
 	return httpServer.URL, attempts
 }
 
+// newListCountingBackend starts a real MCP server exposing a single tool
+// named toolName that echoes its input (via newCountingBackend), fronted by
+// a reverse proxy that additionally counts tools/list requests it forwards
+// — used to prove a tool's inputSchema is resolved from the backend once
+// and cached, not refetched on every tools/call (FEATURE-017).
+func newListCountingBackend(t *testing.T, toolName string) (backendURL string, listCalls *atomic.Int32) {
+	t.Helper()
+
+	realURL, _ := newCountingBackend(t, toolName)
+	target, err := neturl.Parse(realURL)
+	if err != nil {
+		t.Fatalf("url.Parse: %v", err)
+	}
+	reverseProxy := httputil.NewSingleHostReverseProxy(target)
+
+	listCalls = &atomic.Int32{}
+	counting := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			r.Body = io.NopCloser(bytes.NewReader(body))
+			if bytes.Contains(body, []byte(`"tools/list"`)) {
+				listCalls.Add(1)
+			}
+		}
+		reverseProxy.ServeHTTP(w, r)
+	})
+
+	httpServer := httptest.NewServer(counting)
+	t.Cleanup(httpServer.Close)
+
+	return httpServer.URL, listCalls
+}
+
 // newTestResourceBackend starts a real MCP server exposing a single
 // resource and no tools, standing in for a backend whose only capability is
 // resources.
@@ -715,5 +752,103 @@ func TestRateLimitRejectsExcessCalls(t *testing.T) {
 
 	if got := calls.Load(); got != 1 {
 		t.Errorf("backend tool handler ran %d times, want exactly 1 (the rate-limited call never reached it)", got)
+	}
+}
+
+// TestSchemaValidationRejectsInvalidArguments proves tools/call arguments
+// are validated against the tool's own inputSchema before dispatch
+// (FEATURE-017): "echo"'s schema (inferred by mcp.AddTool from echoInput)
+// requires text to be a string, so passing a number for it is rejected with
+// -32602 "Invalid params", and the backend's own handler never runs.
+func TestSchemaValidationRejectsInvalidArguments(t *testing.T) {
+	ctx := context.Background()
+	backendURL, calls := newCountingBackend(t, "echo")
+	backend := dialTestBackend(t, backendURL)
+	gatewayURL := newTestGateway(t, []proxy.Route{{Prefix: "", Backend: backend}})
+	session := connect(t, gatewayURL)
+
+	_, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "echo", Arguments: map[string]any{"text": 12345}})
+	if err == nil {
+		t.Fatal("CallTool: got nil error for arguments violating the tool's inputSchema")
+	}
+
+	var rpcErr *jsonrpc.Error
+	if !errors.As(err, &rpcErr) {
+		t.Fatalf("CallTool error = %v (%T), want a *jsonrpc.Error", err, err)
+	}
+	if rpcErr.Code != -32602 {
+		t.Errorf("CallTool error code = %d, want -32602 (Invalid params)", rpcErr.Code)
+	}
+	if rpcErr.Message != "Invalid params" {
+		t.Errorf("CallTool error message = %q, want %q", rpcErr.Message, "Invalid params")
+	}
+
+	var data map[string]any
+	if err := json.Unmarshal(rpcErr.Data, &data); err != nil {
+		t.Fatalf("Data %s did not unmarshal as JSON: %v", rpcErr.Data, err)
+	}
+	if data["tool"] != "echo" {
+		t.Errorf(`Data["tool"] = %v, want "echo"`, data["tool"])
+	}
+	if detail, _ := data["detail"].(string); detail == "" {
+		t.Error(`Data["detail"] is empty, want a field-level validation message`)
+	}
+
+	if got := calls.Load(); got != 0 {
+		t.Errorf("backend tool handler ran %d times, want 0 (the schema violation never reached it)", got)
+	}
+}
+
+// TestSchemaValidationRejectsMissingRequiredField proves a missing required
+// property is caught the same way as a type mismatch (FEATURE-017).
+func TestSchemaValidationRejectsMissingRequiredField(t *testing.T) {
+	ctx := context.Background()
+	backendURL, calls := newCountingBackend(t, "echo")
+	backend := dialTestBackend(t, backendURL)
+	gatewayURL := newTestGateway(t, []proxy.Route{{Prefix: "", Backend: backend}})
+	session := connect(t, gatewayURL)
+
+	_, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "echo", Arguments: map[string]any{}})
+	if err == nil {
+		t.Fatal("CallTool: got nil error for arguments missing a required field")
+	}
+
+	var rpcErr *jsonrpc.Error
+	if !errors.As(err, &rpcErr) {
+		t.Fatalf("CallTool error = %v (%T), want a *jsonrpc.Error", err, err)
+	}
+	if rpcErr.Code != -32602 {
+		t.Errorf("CallTool error code = %d, want -32602 (Invalid params)", rpcErr.Code)
+	}
+	if got := calls.Load(); got != 0 {
+		t.Errorf("backend tool handler ran %d times, want 0 (the schema violation never reached it)", got)
+	}
+}
+
+// TestSchemaCompiledOnce proves a tool's inputSchema is resolved from the
+// backend once and cached, not recompiled/refetched on every tools/call
+// (FEATURE-017's acceptance criterion): five valid calls to the same tool,
+// with no client-side tools/list ever run first (so the very first call
+// itself must trigger the cache-miss fetch), still only ever cause a single
+// tools/list request to reach the backend.
+func TestSchemaCompiledOnce(t *testing.T) {
+	ctx := context.Background()
+	backendURL, listCalls := newListCountingBackend(t, "echo")
+	backend := dialTestBackend(t, backendURL)
+	gatewayURL := newTestGateway(t, []proxy.Route{{Prefix: "", Backend: backend}})
+	session := connect(t, gatewayURL)
+
+	for i := 0; i < 5; i++ {
+		result, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "echo", Arguments: map[string]any{"text": "hi"}})
+		if err != nil {
+			t.Fatalf("CallTool #%d: %v", i, err)
+		}
+		if result.IsError {
+			t.Fatalf("CallTool #%d result.IsError = true, content: %+v", i, result.Content)
+		}
+	}
+
+	if got := listCalls.Load(); got != 1 {
+		t.Errorf("backend saw %d tools/list requests across 5 tools/call, want exactly 1 (the schema is cached after the first)", got)
 	}
 }

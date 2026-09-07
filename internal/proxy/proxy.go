@@ -48,15 +48,19 @@ type Route struct {
 // client (FEATURE-009); notifications/cancelled needs no handling here,
 // since it propagates automatically through ctx (see NotificationRouter's
 // doc comment). policies resolves the (unprefixed) tool name to the policy
-// governing its dispatch, if any (FEATURE-010 onward).
+// governing its dispatch, if any (FEATURE-010 onward). Every tools/call is
+// also validated against its tool's own inputSchema before dispatch
+// (FEATURE-017), via a schema cache private to this Middleware call.
 func Middleware(routes []Route, router *NotificationRouter, policies *policy.Resolver) mcp.Middleware {
+	schemas := newSchemaCache()
+
 	return func(next mcp.MethodHandler) mcp.MethodHandler {
 		return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
 			switch method {
 			case methodListTools:
-				return listTools(ctx, routes)
+				return listTools(ctx, routes, schemas)
 			case methodCallTool:
-				return callTool(ctx, routes, req, next, router, policies)
+				return callTool(ctx, routes, req, next, router, policies, schemas)
 			default:
 				return next(ctx, method, req)
 			}
@@ -65,8 +69,16 @@ func Middleware(routes []Route, router *NotificationRouter, policies *policy.Res
 }
 
 // listTools calls tools/list on every route and merges the results, with
-// each returned tool renamed to include its backend's prefix.
-func listTools(ctx context.Context, routes []Route) (*mcp.ListToolsResult, error) {
+// each returned tool renamed to include its backend's prefix. It also
+// primes schemas with every tool's compiled inputSchema, so a tools/call
+// that follows a client's own tools/list never pays a schema-compilation
+// round trip (FEATURE-017); a tools/call for a tool nothing has listed yet
+// still resolves and caches its schema lazily, see schemaCache.resolveTool.
+// A tool whose inputSchema fails to compile is still listed — one backend's
+// malformed schema shouldn't hide its tools or anyone else's; that tool's
+// calls simply fall back to schemaCache.resolveTool's own miss handling
+// when dispatched (see callTool).
+func listTools(ctx context.Context, routes []Route, schemas *schemaCache) (*mcp.ListToolsResult, error) {
 	merged := &mcp.ListToolsResult{}
 
 	for _, route := range routes {
@@ -79,6 +91,7 @@ func listTools(ctx context.Context, routes []Route) (*mcp.ListToolsResult, error
 			prefixed := *tool
 			prefixed.Name = route.Prefix + tool.Name
 			merged.Tools = append(merged.Tools, &prefixed)
+			_ = schemas.refresh(prefixed.Name, &prefixed)
 		}
 	}
 
@@ -103,8 +116,16 @@ func listTools(ctx context.Context, routes []Route) (*mcp.ListToolsResult, error
 // and a request too close to its deadline is aborted before a wasted round
 // trip. Any resulting circuit-open, rate-limit, timeout, or panic error is
 // mapped to its documented JSON-RPC code (FEATURE-014) rather than reaching
-// the client as a generic internal error.
-func callTool(ctx context.Context, routes []Route, req mcp.Request, next mcp.MethodHandler, router *NotificationRouter, policies *policy.Resolver) (mcp.Result, error) {
+// the client as a generic internal error. Before any of that, the request's
+// arguments are validated against the tool's own inputSchema, if one is
+// known (FEATURE-017); a violation returns -32602 without ever reaching
+// resile.Do, so it isn't counted as a circuit-breaker failure or charged
+// against the rate limit. Schema *resolution* failing — the tool declares
+// no schema, its schema doesn't compile, or fetching it from the backend
+// errors — is not itself a violation: dispatch proceeds unvalidated and
+// lets the normal resilience pipeline handle a genuinely unreachable
+// backend, rather than a validation-layer error masking it.
+func callTool(ctx context.Context, routes []Route, req mcp.Request, next mcp.MethodHandler, router *NotificationRouter, policies *policy.Resolver, schemas *schemaCache) (mcp.Result, error) {
 	params, ok := req.GetParams().(*mcp.CallToolParamsRaw)
 	if !ok {
 		return nil, fmt.Errorf("proxy: unexpected params type %T for %s", req.GetParams(), methodCallTool)
@@ -119,6 +140,12 @@ func callTool(ctx context.Context, routes []Route, req mcp.Request, next mcp.Met
 		Meta:      maps.Clone(params.Meta),
 		Name:      name,
 		Arguments: json.RawMessage(params.Arguments),
+	}
+
+	if resolved, ok, err := schemas.resolveTool(ctx, route, params.Name); err == nil && ok {
+		if err := validateArguments(resolved, name, params.Arguments); err != nil {
+			return nil, err
+		}
 	}
 
 	if session, ok := req.GetSession().(*mcp.ServerSession); ok {
