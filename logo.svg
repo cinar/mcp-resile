@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 240" width="240" height="240" role="img" aria-label="mcp-resile logo: a shield around a circuit-breaker switch">
+  <title>mcp-resile</title>
+  <defs>
+    <linearGradient id="shieldGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#00ADD8"/>
+      <stop offset="100%" stop-color="#3ddc97"/>
+    </linearGradient>
+    <linearGradient id="sheen" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.22"/>
+      <stop offset="45%" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+
+  <path d="M 120 26
+           C 150 26 176 40 192 56
+           L 192 118
+           C 192 168 160 198 120 216
+           C 80 198 48 168 48 118
+           L 48 56
+           C 64 40 90 26 120 26
+           Z"
+        fill="url(#shieldGrad)"
+        stroke="#072430"
+        stroke-opacity="0.28"
+        stroke-width="4"/>
+
+  <path d="M 120 26
+           C 150 26 176 40 192 56
+           L 192 118
+           C 192 168 160 198 120 216
+           C 80 198 48 168 48 118
+           L 48 56
+           C 64 40 90 26 120 26
+           Z"
+        fill="url(#sheen)"/>
+
+  <path d="M 139.5 100.15
+           A 34 34 0 1 1 100.5 100.15"
+        fill="none"
+        stroke="#0a1420"
+        stroke-width="16"
+        stroke-linecap="round"/>
+
+  <line x1="120" y1="86" x2="120" y2="120"
+        stroke="#0a1420"
+        stroke-width="16"
+        stroke-linecap="round"/>
+</svg>
