@@ -88,10 +88,13 @@ func listTools(ctx context.Context, routes []Route) (*mcp.ListToolsResult, error
 // before forwarding, so a resulting notifications/progress from the backend
 // can be routed back to the calling client and restored to its own token.
 // The (unprefixed) tool name is resolved against policies; a match with a
-// circuit breaker and/or retries configured dispatches through resile
-// (FEATURE-011, FEATURE-012), so sustained backend failures make subsequent
-// calls fail fast, and transient ones get retried with full-jitter backoff,
-// instead of every failure reaching the client as-is.
+// circuit breaker, retries, and/or a rate limit configured dispatches
+// through resile (FEATURE-011, FEATURE-012, FEATURE-013), so sustained
+// backend failures make subsequent calls fail fast, transient ones get
+// retried with full-jitter backoff, and excess calls are shed before
+// reaching the backend. Any resulting circuit-open, rate-limit, or timeout
+// error is mapped to its documented JSON-RPC code (FEATURE-014) rather than
+// reaching the client as a generic internal error.
 func callTool(ctx context.Context, routes []Route, req mcp.Request, next mcp.MethodHandler, router *NotificationRouter, policies *policy.Resolver) (mcp.Result, error) {
 	params, ok := req.GetParams().(*mcp.CallToolParamsRaw)
 	if !ok {
@@ -137,7 +140,11 @@ func callTool(ctx context.Context, routes []Route, req mcp.Request, next mcp.Met
 		return dispatch(ctx)
 	}
 
-	return resile.Do(ctx, dispatch, opts...)
+	result, err := resile.Do(ctx, dispatch, opts...)
+	if err != nil {
+		return nil, mapResilienceError(err, p.Resilience.RateLimit)
+	}
+	return result, nil
 }
 
 // resilienceOptions builds the resile.Options a policy's dispatch should run

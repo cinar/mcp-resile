@@ -3,16 +3,18 @@ package proxy_test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httputil"
 	neturl "net/url"
-	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/cinar/mcp-resile/internal/config"
@@ -553,7 +555,8 @@ func TestUnknownToolFallsThrough(t *testing.T) {
 // breaker actually gates dispatch end-to-end (FEATURE-011): calling a tool
 // name that doesn't exist on the backend fails every time via a real
 // JSON-RPC error, and once the breaker trips, that keeps failing but with
-// the breaker's own error, not the backend's — meaning later calls in the
+// the breaker's own error, mapped to the -33002 "circuit open" code
+// (FEATURE-014), not the backend's own error — meaning later calls in the
 // run stopped reaching the backend at all.
 func TestCircuitBreakerOpensAfterSustainedFailures(t *testing.T) {
 	ctx := context.Background()
@@ -578,8 +581,15 @@ func TestCircuitBreakerOpensAfterSustainedFailures(t *testing.T) {
 		}
 	}
 
-	if !strings.Contains(lastErr.Error(), "circuit breaker is open") {
-		t.Errorf("after 20 straight failures, CallTool error = %q, want it to mention the circuit breaker is open", lastErr.Error())
+	var rpcErr *jsonrpc.Error
+	if !errors.As(lastErr, &rpcErr) {
+		t.Fatalf("after 20 straight failures, CallTool error = %v (%T), want a *jsonrpc.Error", lastErr, lastErr)
+	}
+	if rpcErr.Code != -33002 {
+		t.Errorf("after 20 straight failures, CallTool error code = %d, want -33002 (circuit open)", rpcErr.Code)
+	}
+	if rpcErr.Message != "Service unavailable" {
+		t.Errorf("after 20 straight failures, CallTool error message = %q, want %q", rpcErr.Message, "Service unavailable")
 	}
 }
 
@@ -680,8 +690,27 @@ func TestRateLimitRejectsExcessCalls(t *testing.T) {
 	if err == nil {
 		t.Fatal("second CallTool: got nil error, want the rate limit to reject it")
 	}
-	if !strings.Contains(err.Error(), "rate limit exceeded") {
-		t.Errorf("second CallTool error = %q, want it to mention the rate limit", err.Error())
+
+	var rpcErr *jsonrpc.Error
+	if !errors.As(err, &rpcErr) {
+		t.Fatalf("second CallTool error = %v (%T), want a *jsonrpc.Error", err, err)
+	}
+	if rpcErr.Code != -33001 {
+		t.Errorf("second CallTool error code = %d, want -33001 (rate limit exceeded)", rpcErr.Code)
+	}
+	if rpcErr.Message != "Rate limit exceeded" {
+		t.Errorf("second CallTool error message = %q, want %q", rpcErr.Message, "Rate limit exceeded")
+	}
+
+	var data map[string]any
+	if err := json.Unmarshal(rpcErr.Data, &data); err != nil {
+		t.Fatalf("Data %s did not unmarshal as JSON: %v", rpcErr.Data, err)
+	}
+	if data["reason"] != "rate_limited" {
+		t.Errorf(`Data["reason"] = %v, want "rate_limited"`, data["reason"])
+	}
+	if _, ok := data["retry_after_ms"]; !ok {
+		t.Error(`Data missing "retry_after_ms"`)
 	}
 
 	if got := calls.Load(); got != 1 {
