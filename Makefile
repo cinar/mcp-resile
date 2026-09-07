@@ -1,9 +1,10 @@
 .PHONY: build test lint
 
 BINARY := bin/mcp-resile
+VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 
 build:
-	CGO_ENABLED=0 go build -o $(BINARY) ./cmd/mcp-resile
+	CGO_ENABLED=0 go build -ldflags "-X github.com/cinar/mcp-resile/internal/version.Version=$(VERSION)" -o $(BINARY) ./cmd/mcp-resile
 
 test:
 	go test -race ./...

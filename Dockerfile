@@ -6,12 +6,20 @@
 FROM golang:1.25 AS build
 WORKDIR /src
 
+# Not derived from .git (not part of the build context — see .dockerignore):
+# pass --build-arg VERSION=$(git describe --tags --always --dirty) to stamp
+# a real version; defaults to "dev", matching internal/version.Version's own
+# default when unset.
+ARG VERSION=dev
+
 COPY go.mod go.sum ./
 RUN go mod download
 
 COPY cmd/ cmd/
 COPY internal/ internal/
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/mcp-resile ./cmd/mcp-resile
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath \
+    -ldflags "-s -w -X github.com/cinar/mcp-resile/internal/version.Version=${VERSION}" \
+    -o /out/mcp-resile ./cmd/mcp-resile
 
 # Runtime stage: distroless/static (spec.md §9) — no shell, no package
 # manager, nothing beyond the binary itself and CA certificates, which
