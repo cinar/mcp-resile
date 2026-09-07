@@ -34,6 +34,17 @@ const (
 	defaultWriteTimeout     = 30 * time.Second
 	defaultMaxRequestBytes  = 1 << 20   // 1 MiB
 	defaultMaxResponseBytes = 512 << 10 // 512 KiB
+
+	// backoffFullJitter is the only backoff resile currently provides
+	// (resile.NewFullJitter); it's still a named config value, not
+	// hardcoded, since it's what spec.md §7's backoff: field documents.
+	backoffFullJitter = "full_jitter"
+
+	// defaultRetryMaxAttempts/BaseDelay/MaxDelay mirror resile.DefaultConfig's
+	// own defaults, reused here rather than inventing separate numbers.
+	defaultRetryMaxAttempts = 5
+	defaultRetryBaseDelay   = 100 * time.Millisecond
+	defaultRetryMaxDelay    = 30 * time.Second
 )
 
 // errUnsupportedServerTransport and errUnsupportedBackendTransport back the
@@ -98,11 +109,24 @@ type CircuitBreaker struct {
 	ResetTimeout   Duration `yaml:"reset_timeout"`
 }
 
+// Retries is the resilience.retries: sub-block of a policy (spec.md §7),
+// mapping onto resile.WithMaxAttempts/WithBackoff (FEATURE-012). Like
+// CircuitBreaker, it's a pointer so "retries omitted" and "retries present
+// with defaults" stay distinguishable, and so validateRetries/applyDefaults
+// handle it by hand rather than via checker's struct-field auto-recursion.
+type Retries struct {
+	MaxAttempts uint     `yaml:"max_attempts"`
+	BaseDelay   Duration `yaml:"base_delay"`
+	MaxDelay    Duration `yaml:"max_delay"`
+	Backoff     string   `yaml:"backoff"`
+}
+
 // Resilience is the resilience: sub-block of a policy (spec.md §7). Later
-// features (FEATURE-012 onward) add retries/rate_limit/timeout as they
-// start consuming them.
+// features (FEATURE-013 onward) add rate_limit/timeout as they start
+// consuming them.
 type Resilience struct {
 	CircuitBreaker *CircuitBreaker `yaml:"circuit_breaker"`
+	Retries        *Retries        `yaml:"retries"`
 }
 
 // Policy is one entry of the policies: list (spec.md §7). A tool name is
@@ -210,6 +234,9 @@ func validatePolicies(policies []Policy) error {
 		if err := validateCircuitBreaker(p.Resilience.CircuitBreaker); err != nil {
 			return fmt.Errorf("policy %q: %w", p.ToolPattern, err)
 		}
+		if err := validateRetries(p.Resilience.Retries); err != nil {
+			return fmt.Errorf("policy %q: %w", p.ToolPattern, err)
+		}
 	}
 	return nil
 }
@@ -232,6 +259,25 @@ func validateCircuitBreaker(cb *CircuitBreaker) error {
 	}
 	if cb.ResetTimeout < 0 {
 		return fmt.Errorf("circuit_breaker.reset_timeout: must not be negative")
+	}
+	return nil
+}
+
+// validateRetries checks fields left after applyDefaults has already filled
+// in the zero ones, so what's left to reject is only an explicit mistake: a
+// negative delay, or a backoff other than the one resile currently supports.
+func validateRetries(r *Retries) error {
+	if r == nil {
+		return nil
+	}
+	if r.BaseDelay < 0 {
+		return fmt.Errorf("retries.base_delay: must not be negative")
+	}
+	if r.MaxDelay < 0 {
+		return fmt.Errorf("retries.max_delay: must not be negative")
+	}
+	if r.Backoff != backoffFullJitter {
+		return fmt.Errorf("retries.backoff: unsupported backoff %q, only %q is supported in v1", r.Backoff, backoffFullJitter)
 	}
 	return nil
 }
@@ -261,6 +307,25 @@ func (c *Config) applyDefaults() {
 	for i := range c.Backends {
 		if c.Backends[i].Transport == "" {
 			c.Backends[i].Transport = backendTransportHTTP
+		}
+	}
+
+	for i := range c.Policies {
+		r := c.Policies[i].Resilience.Retries
+		if r == nil {
+			continue
+		}
+		if r.MaxAttempts == 0 {
+			r.MaxAttempts = defaultRetryMaxAttempts
+		}
+		if r.BaseDelay == 0 {
+			r.BaseDelay = Duration(defaultRetryBaseDelay)
+		}
+		if r.MaxDelay == 0 {
+			r.MaxDelay = Duration(defaultRetryMaxDelay)
+		}
+		if r.Backoff == "" {
+			r.Backoff = backoffFullJitter
 		}
 	}
 }

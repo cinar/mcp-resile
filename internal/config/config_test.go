@@ -160,6 +160,78 @@ policies:
 	}
 }
 
+func TestParsePolicyRetries(t *testing.T) {
+	yaml := `
+server:
+  listen: "0.0.0.0:8080"
+backends:
+  - id: "svc"
+    url: "http://svc.internal/mcp"
+policies:
+  - tool_pattern: "db_read_*"
+    resilience:
+      retries:
+        max_attempts: 3
+        base_delay: "150ms"
+        max_delay: "2000ms"
+        backoff: "full_jitter"
+`
+	cfg, err := config.Parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	r := cfg.Policies[0].Resilience.Retries
+	if r == nil {
+		t.Fatal("Policies[0].Resilience.Retries is nil, want it populated")
+	}
+	if r.MaxAttempts != 3 {
+		t.Errorf("MaxAttempts = %d, want 3", r.MaxAttempts)
+	}
+	if time.Duration(r.BaseDelay) != 150*time.Millisecond {
+		t.Errorf("BaseDelay = %v, want 150ms", time.Duration(r.BaseDelay))
+	}
+	if time.Duration(r.MaxDelay) != 2*time.Second {
+		t.Errorf("MaxDelay = %v, want 2s", time.Duration(r.MaxDelay))
+	}
+	if r.Backoff != "full_jitter" {
+		t.Errorf("Backoff = %q, want %q", r.Backoff, "full_jitter")
+	}
+}
+
+func TestParsePolicyRetriesAppliesDefaults(t *testing.T) {
+	yaml := `
+server:
+  listen: "0.0.0.0:8080"
+backends:
+  - id: "svc"
+    url: "http://svc.internal/mcp"
+policies:
+  - tool_pattern: "db_read_*"
+    resilience:
+      retries: {}
+`
+	cfg, err := config.Parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	r := cfg.Policies[0].Resilience.Retries
+	if r == nil {
+		t.Fatal("Policies[0].Resilience.Retries is nil, want it populated")
+	}
+	if r.MaxAttempts != 5 {
+		t.Errorf("MaxAttempts = %d, want default 5", r.MaxAttempts)
+	}
+	if time.Duration(r.BaseDelay) != 100*time.Millisecond {
+		t.Errorf("BaseDelay = %v, want default 100ms", time.Duration(r.BaseDelay))
+	}
+	if time.Duration(r.MaxDelay) != 30*time.Second {
+		t.Errorf("MaxDelay = %v, want default 30s", time.Duration(r.MaxDelay))
+	}
+	if r.Backoff != "full_jitter" {
+		t.Errorf("Backoff = %q, want default %q", r.Backoff, "full_jitter")
+	}
+}
+
 func TestParseNoPolicies(t *testing.T) {
 	cfg, err := config.Parse([]byte(validYAML))
 	if err != nil {
@@ -377,6 +449,38 @@ policies:
         window_duration: "-1s"
 `,
 			wantErr: "circuit_breaker.window_duration: must not be negative",
+		},
+		{
+			name: "retries negative base_delay",
+			yaml: `
+server:
+  listen: "0.0.0.0:8080"
+backends:
+  - id: "svc"
+    url: "http://svc.internal/mcp"
+policies:
+  - tool_pattern: "db_read_*"
+    resilience:
+      retries:
+        base_delay: "-150ms"
+`,
+			wantErr: "retries.base_delay: must not be negative",
+		},
+		{
+			name: "retries unsupported backoff",
+			yaml: `
+server:
+  listen: "0.0.0.0:8080"
+backends:
+  - id: "svc"
+    url: "http://svc.internal/mcp"
+policies:
+  - tool_pattern: "db_read_*"
+    resilience:
+      retries:
+        backoff: "exponential"
+`,
+			wantErr: `retries.backoff: unsupported backoff "exponential"`,
 		},
 	}
 

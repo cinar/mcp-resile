@@ -1,10 +1,15 @@
 package proxy_test
 
 import (
+	"bytes"
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
+	neturl "net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -45,6 +50,80 @@ func newTestBackend(t *testing.T, toolName string) string {
 	t.Cleanup(httpServer.Close)
 
 	return httpServer.URL
+}
+
+// newCountingBackend starts a real MCP server exposing a single tool named
+// toolName that echoes its input, and returns its URL along with a counter
+// of the tools/call requests it has received — for proving how many dispatch
+// attempts a call actually made it to the backend (FEATURE-012).
+func newCountingBackend(t *testing.T, toolName string) (url string, calls *atomic.Int32) {
+	t.Helper()
+
+	calls = &atomic.Int32{}
+	server := mcp.NewServer(&mcp.Implementation{Name: "backend", Version: "test"}, nil)
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        toolName,
+		Description: "Echoes the given text back",
+	}, func(_ context.Context, _ *mcp.CallToolRequest, in echoInput) (*mcp.CallToolResult, echoOutput, error) {
+		calls.Add(1)
+		return nil, echoOutput{Text: in.Text}, nil
+	})
+
+	handler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server {
+		return server
+	}, nil)
+	httpServer := httptest.NewServer(handler)
+	t.Cleanup(httpServer.Close)
+
+	return httpServer.URL, calls
+}
+
+// newFlakyBackend starts a real MCP server exposing a single tool named
+// toolName that echoes its input, fronted by a reverse proxy (so the real
+// transport, headers, and any SSE streaming are handled correctly by the
+// standard library rather than a hand-rolled stand-in) whose first
+// failCount tools/call requests get a 503 response before every later one
+// reaches the server unmodified. A 503 is one of the HTTP statuses go-sdk's
+// streamable HTTP client itself treats as transient (wrapping it with its
+// own jsonrpc2.ErrRejected, code -32005) — exactly the signal
+// proxy.isTransientError keys off of — so this exercises the real go-sdk
+// code path FEATURE-012 depends on, not a synthetic stand-in for it. The
+// returned counter tracks every tools/call request the wrapper has seen,
+// regardless of the tool name it targets or whether it was rejected —
+// i.e. the number of dispatch attempts made over the wire.
+func newFlakyBackend(t *testing.T, toolName string, failCount int) (backendURL string, attempts *atomic.Int32) {
+	t.Helper()
+
+	realURL, _ := newCountingBackend(t, toolName)
+	target, err := neturl.Parse(realURL)
+	if err != nil {
+		t.Fatalf("url.Parse: %v", err)
+	}
+	reverseProxy := httputil.NewSingleHostReverseProxy(target)
+
+	attempts = &atomic.Int32{}
+	flaky := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			r.Body = io.NopCloser(bytes.NewReader(body))
+			if bytes.Contains(body, []byte(`"tools/call"`)) {
+				if n := attempts.Add(1); n <= int32(failCount) {
+					w.WriteHeader(http.StatusServiceUnavailable)
+					return
+				}
+			}
+		}
+		reverseProxy.ServeHTTP(w, r)
+	})
+
+	httpServer := httptest.NewServer(flaky)
+	t.Cleanup(httpServer.Close)
+
+	return httpServer.URL, attempts
 }
 
 // newTestResourceBackend starts a real MCP server exposing a single
@@ -501,5 +580,71 @@ func TestCircuitBreakerOpensAfterSustainedFailures(t *testing.T) {
 
 	if !strings.Contains(lastErr.Error(), "circuit breaker is open") {
 		t.Errorf("after 20 straight failures, CallTool error = %q, want it to mention the circuit breaker is open", lastErr.Error())
+	}
+}
+
+// TestRetriesRecoverFromTransientFailure proves a policy's retries actually
+// mask a transient backend failure end-to-end (FEATURE-012): the backend
+// rejects the first two attempts with a 503 (transient), and the call still
+// succeeds because the third attempt gets through.
+func TestRetriesRecoverFromTransientFailure(t *testing.T) {
+	ctx := context.Background()
+	backendURL, attempts := newFlakyBackend(t, "echo", 2)
+	backend := dialTestBackend(t, backendURL)
+	gatewayURL := newTestGateway(t, []proxy.Route{{Prefix: "", Backend: backend}}, config.Policy{
+		ToolPattern: "echo",
+		Resilience: config.Resilience{
+			Retries: &config.Retries{
+				MaxAttempts: 3,
+				BaseDelay:   config.Duration(time.Millisecond),
+				MaxDelay:    config.Duration(5 * time.Millisecond),
+			},
+		},
+	})
+	session := connect(t, gatewayURL)
+
+	result, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "echo",
+		Arguments: map[string]any{"text": "hello"},
+	})
+	if err != nil {
+		t.Fatalf("CallTool: %v, want it to succeed once retries exhaust the transient failures", err)
+	}
+	if result.IsError {
+		t.Fatalf("CallTool result.IsError = true, content: %+v", result.Content)
+	}
+	if got, want := result.StructuredContent.(map[string]any)["text"], "hello"; got != want {
+		t.Errorf("StructuredContent.text = %v, want %v", got, want)
+	}
+	if got := attempts.Load(); got != 3 {
+		t.Errorf("backend saw %d tools/call attempts, want exactly 3 (2 rejected, then the successful retry)", got)
+	}
+}
+
+// TestRetriesDoNotRetryNonTransientErrors proves a non-transient error
+// (here, an application-level "unknown tool" JSON-RPC error) is never
+// retried (FEATURE-012), even though the policy allows up to 3 attempts:
+// only one attempt should ever reach the backend.
+func TestRetriesDoNotRetryNonTransientErrors(t *testing.T) {
+	ctx := context.Background()
+	backendURL, attempts := newFlakyBackend(t, "echo", 0)
+	backend := dialTestBackend(t, backendURL)
+	gatewayURL := newTestGateway(t, []proxy.Route{{Prefix: "", Backend: backend}}, config.Policy{
+		ToolPattern: "boom",
+		Resilience: config.Resilience{
+			Retries: &config.Retries{
+				MaxAttempts: 3,
+				BaseDelay:   config.Duration(time.Millisecond),
+				MaxDelay:    config.Duration(5 * time.Millisecond),
+			},
+		},
+	})
+	session := connect(t, gatewayURL)
+
+	if _, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "boom", Arguments: map[string]any{}}); err == nil {
+		t.Fatal("CallTool: got nil error for a tool the backend doesn't expose")
+	}
+	if got := attempts.Load(); got != 1 {
+		t.Errorf("backend saw %d tools/call attempts for a non-transient error, want exactly 1 (no retry)", got)
 	}
 }

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"maps"
 	"strings"
+	"time"
 
 	"github.com/cinar/resile"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -87,9 +88,10 @@ func listTools(ctx context.Context, routes []Route) (*mcp.ListToolsResult, error
 // before forwarding, so a resulting notifications/progress from the backend
 // can be routed back to the calling client and restored to its own token.
 // The (unprefixed) tool name is resolved against policies; a match with a
-// circuit breaker configured dispatches through it (FEATURE-011), so
-// sustained backend failures make subsequent calls fail fast instead of
-// reaching an already-unhealthy backend.
+// circuit breaker and/or retries configured dispatches through resile
+// (FEATURE-011, FEATURE-012), so sustained backend failures make subsequent
+// calls fail fast, and transient ones get retried with full-jitter backoff,
+// instead of every failure reaching the client as-is.
 func callTool(ctx context.Context, routes []Route, req mcp.Request, next mcp.MethodHandler, router *NotificationRouter, policies *policy.Resolver) (mcp.Result, error) {
 	params, ok := req.GetParams().(*mcp.CallToolParamsRaw)
 	if !ok {
@@ -119,17 +121,50 @@ func callTool(ctx context.Context, routes []Route, req mcp.Request, next mcp.Met
 		return route.Backend.CallTool(ctx, forwarded)
 	}
 
-	if p, ok := policies.Resolve(name); ok {
-		if cb := p.CircuitBreaker(); cb != nil {
-			// MaxAttempts is pinned to 1: resile.Do otherwise defaults to 5
-			// attempts with full-jitter backoff (resile.DefaultConfig),
-			// which would silently implement FEATURE-012's retry behavior
-			// ahead of schedule.
-			return resile.Do(ctx, dispatch, resile.WithCircuitBreaker(cb), resile.WithMaxAttempts(1))
-		}
+	p, ok := policies.Resolve(name)
+	if !ok {
+		return dispatch(ctx)
 	}
 
-	return dispatch(ctx)
+	opts := resilienceOptions(p)
+	if len(opts) == 0 {
+		// No circuit breaker or retries configured for this policy: dispatch
+		// directly rather than through an "empty" resile.Do, which would
+		// otherwise silently inherit resile.DefaultConfig's own defaults
+		// (e.g. a 5ms MinDeadlineThreshold) ahead of FEATURE-015 wiring it
+		// up on purpose.
+		return dispatch(ctx)
+	}
+
+	return resile.Do(ctx, dispatch, opts...)
+}
+
+// resilienceOptions builds the resile.Options a policy's dispatch should run
+// with. A circuit breaker and retries can both be configured on the same
+// policy and combine into one resile.Do call, matching spec.md §8's
+// ToolExecutionEngine example.
+func resilienceOptions(p *policy.Policy) []resile.Option {
+	var opts []resile.Option
+
+	if cb := p.CircuitBreaker(); cb != nil {
+		opts = append(opts, resile.WithCircuitBreaker(cb))
+	}
+
+	if r := p.Resilience.Retries; r != nil {
+		opts = append(opts,
+			resile.WithMaxAttempts(r.MaxAttempts),
+			resile.WithBackoff(resile.NewFullJitter(time.Duration(r.BaseDelay), time.Duration(r.MaxDelay))),
+			resile.WithRetryIfFunc(isTransientError),
+		)
+	} else if len(opts) > 0 {
+		// A circuit breaker but no retries: pin attempts to 1. resile.Do
+		// otherwise defaults to 5 attempts with full-jitter backoff
+		// (resile.DefaultConfig), which would silently retry on this
+		// policy's behalf without it having asked for that.
+		opts = append(opts, resile.WithMaxAttempts(1))
+	}
+
+	return opts
 }
 
 // MergeCapabilities returns the union of every route's backend capabilities
