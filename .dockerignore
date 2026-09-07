@@ -1,0 +1,6 @@
+.git
+bin/
+*.test
+*.out
+coverage.*
+*.coverprofile
