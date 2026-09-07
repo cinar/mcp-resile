@@ -1,6 +1,8 @@
 package config_test
 
 import (
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -820,6 +822,76 @@ backends:
 `,
 			wantErr: `telemetry.logging.format: unsupported format "yaml"`,
 		},
+		{
+			name: "unknown top-level field",
+			yaml: `
+server:
+  listen: "0.0.0.0:8080"
+backends:
+  - id: "svc"
+    url: "http://svc.internal/mcp"
+polcies:
+  - tool_pattern: "db_read_*"
+`,
+			wantErr: "field polcies not found",
+		},
+		{
+			name: "unknown nested field",
+			yaml: `
+server:
+  listen: "0.0.0.0:8080"
+  listne: "0.0.0.0:9090"
+backends:
+  - id: "svc"
+    url: "http://svc.internal/mcp"
+`,
+			wantErr: "field listne not found",
+		},
+		{
+			name: "duplicate backend id",
+			yaml: `
+server:
+  listen: "0.0.0.0:8080"
+backends:
+  - id: "svc"
+    prefix: "a_"
+    url: "http://a.internal/mcp"
+  - id: "svc"
+    prefix: "b_"
+    url: "http://b.internal/mcp"
+`,
+			wantErr: `duplicate id "svc"`,
+		},
+		{
+			name: "policy resilience.timeout not supported",
+			yaml: `
+server:
+  listen: "0.0.0.0:8080"
+backends:
+  - id: "svc"
+    url: "http://svc.internal/mcp"
+policies:
+  - tool_pattern: "db_read_*"
+    resilience:
+      timeout: "3s"
+`,
+			wantErr: "resilience.timeout: not supported in v1",
+		},
+		{
+			name: "policy validation block not supported",
+			yaml: `
+server:
+  listen: "0.0.0.0:8080"
+backends:
+  - id: "svc"
+    url: "http://svc.internal/mcp"
+policies:
+  - tool_pattern: "db_read_*"
+    validation:
+      reject_unknown_fields: true
+`,
+			wantErr: "validation: not supported in v1",
+		},
 	}
 
 	for _, tc := range cases {
@@ -839,5 +911,38 @@ func TestLoadMissingFile(t *testing.T) {
 	_, err := config.Load("/nonexistent/mcp-resile.yaml")
 	if err == nil {
 		t.Fatal("Load: got nil error for a nonexistent file")
+	}
+}
+
+// TestLoadInvalidConfigNamesFileLocation proves the FEATURE-022 acceptance
+// criterion end-to-end through Load (not just Parse): an invalid config
+// file's error names both the offending field and the file's own path, not
+// a generic parse error.
+func TestLoadInvalidConfigNamesFileLocation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "mcp-resile.yaml")
+	invalid := `
+server:
+  listen: "0.0.0.0:8080"
+backends:
+  - id: "svc"
+    prefix: "a_"
+    url: "http://a.internal/mcp"
+  - id: "svc"
+    prefix: "b_"
+    url: "http://b.internal/mcp"
+`
+	if err := os.WriteFile(path, []byte(invalid), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	_, err := config.Load(path)
+	if err == nil {
+		t.Fatal("Load: got nil error for a config with duplicate backend ids")
+	}
+	if !strings.Contains(err.Error(), path) {
+		t.Errorf("Load error = %q, want it to name the file location %q", err.Error(), path)
+	}
+	if !strings.Contains(err.Error(), `duplicate id "svc"`) {
+		t.Errorf(`Load error = %q, want it to name the offending field ("duplicate id \"svc\"")`, err.Error())
 	}
 }

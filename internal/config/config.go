@@ -7,14 +7,18 @@
 // required fields are rejected here, at load time, rather than surfacing as
 // a confusing failure on the first request. Field validation is delegated
 // to github.com/cinar/checker via struct tags; rules checker can't express
-// — that prefixes must be distinct across backends, and that tool_pattern
-// must be a well-formed glob — are checked separately, since checker only
-// validates within one struct and has no glob-syntax checker.
+// — that prefixes/ids must be distinct across backends, that tool_pattern
+// must be a well-formed glob, and that an unrecognized YAML key anywhere in
+// the document is rejected rather than silently ignored (FEATURE-022) —
+// are checked separately, since checker only validates within one struct
+// and has no glob-syntax or unknown-field checker of its own.
 package config
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path"
 	"sort"
@@ -154,11 +158,31 @@ type RateLimit struct {
 // (FEATURE-015): a scalar duration, not a pointer sub-block like the others,
 // so its zero value means "unconfigured" directly — proxy.resilienceOptions
 // passes it to resile as-is either way (see its doc comment for why).
+//
+// Timeout maps onto resile.WithTimeout, per spec.md §7's own example — but
+// no shipped FEATURE ever adopted it as an acceptance criterion (only
+// min_deadline_threshold, FEATURE-015, did), so it isn't wired into
+// proxy.resilienceOptions. It's still parsed rather than silently dropped:
+// validatePolicies rejects a non-zero value with a clear "not supported in
+// v1" error (FEATURE-022) instead of accepting a config field that would
+// silently do nothing.
 type Resilience struct {
 	CircuitBreaker       *CircuitBreaker `yaml:"circuit_breaker"`
 	Retries              *Retries        `yaml:"retries"`
 	RateLimit            *RateLimit      `yaml:"rate_limit"`
 	MinDeadlineThreshold Duration        `yaml:"min_deadline_threshold"`
+	Timeout              Duration        `yaml:"timeout"`
+}
+
+// Validation is the validation: sub-block of a policy (spec.md §7, §5.2).
+// Like Resilience.Timeout, it's parsed (so it's recognized rather than
+// rejected as an unknown field) but not enforced: FEATURE-017 shipped only
+// inputSchema validation, not reject_unknown_fields/max_argument_bytes (see
+// its own commit message) — validatePolicies rejects a config that actually
+// sets these with a clear "not supported in v1" error.
+type Validation struct {
+	RejectUnknownFields bool  `yaml:"reject_unknown_fields"`
+	MaxArgumentBytes    int64 `yaml:"max_argument_bytes"`
 }
 
 // Policy is one entry of the policies: list (spec.md §7). A tool name is
@@ -167,6 +191,7 @@ type Resilience struct {
 // validation/resilience fields as they start consuming them.
 type Policy struct {
 	ToolPattern string     `yaml:"tool_pattern" checkers:"required"`
+	Validation  Validation `yaml:"validation"`
 	Resilience  Resilience `yaml:"resilience"`
 }
 
@@ -233,7 +258,20 @@ func Load(path string) (*Config, error) {
 // Parse validates and returns the config encoded in data.
 func Parse(data []byte) (*Config, error) {
 	var cfg Config
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
+
+	// KnownFields rejects any YAML key that doesn't map to a field on its
+	// corresponding struct (e.g. a typo'd "polcies:", or "resilience.timout")
+	// as a decode error naming the field and line number, rather than
+	// yaml.Unmarshal's default of silently ignoring it — a misspelled
+	// section would otherwise load successfully with that whole section
+	// simply missing, which is a worse failure mode than a loud one
+	// (FEATURE-022).
+	decoder := yaml.NewDecoder(bytes.NewReader(data))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(&cfg); err != nil && !errors.Is(err, io.EOF) {
+		// io.EOF means data was empty (or all comments/whitespace): leave cfg
+		// at its zero value and let the required-field checks below produce
+		// a clear error, rather than surfacing the low-level EOF here.
 		return nil, fmt.Errorf("parsing config: %w", err)
 	}
 
@@ -263,6 +301,9 @@ func Parse(data []byte) (*Config, error) {
 		return nil, err
 	}
 	if err := validateLogging(cfg.Telemetry.Logging); err != nil {
+		return nil, err
+	}
+	if err := validateBackendIDs(cfg.Backends); err != nil {
 		return nil, err
 	}
 	if err := validatePrefixes(cfg.Backends); err != nil {
@@ -352,6 +393,24 @@ func validatePrefixes(backends []Backend) error {
 	return nil
 }
 
+// validateBackendIDs requires every backend's id to be unique, regardless
+// of backend count (unlike prefix, which is only required/checked once
+// there's more than one backend). A duplicate id is always a config
+// mistake — most likely a copy-pasted backend entry with the prefix/url
+// edited but the id left behind — and it would otherwise surface only as
+// confusing duplicate "backend" labels in logs/metrics (FEATURE-020,
+// FEATURE-021), never as a load-time error (FEATURE-022).
+func validateBackendIDs(backends []Backend) error {
+	seenAt := make(map[string]int, len(backends))
+	for i, b := range backends {
+		if first, ok := seenAt[b.ID]; ok {
+			return fmt.Errorf("backends[%d] and backends[%d]: duplicate id %q", first, i, b.ID)
+		}
+		seenAt[b.ID] = i
+	}
+	return nil
+}
+
 // validatePolicies checks that every policy's tool_pattern is a well-formed
 // glob per path.Match's syntax, so a malformed pattern is rejected here, at
 // load time, rather than silently never matching (or erroring) on the first
@@ -374,6 +433,12 @@ func validatePolicies(policies []Policy) error {
 		}
 		if p.Resilience.MinDeadlineThreshold < 0 {
 			return fmt.Errorf("policy %q: resilience.min_deadline_threshold: must not be negative", p.ToolPattern)
+		}
+		if p.Resilience.Timeout != 0 {
+			return fmt.Errorf("policy %q: resilience.timeout: not supported in v1 (use min_deadline_threshold)", p.ToolPattern)
+		}
+		if p.Validation != (Validation{}) {
+			return fmt.Errorf("policy %q: validation: not supported in v1 (only the tool's own inputSchema is validated)", p.ToolPattern)
 		}
 	}
 	return nil
