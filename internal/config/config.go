@@ -1,18 +1,22 @@
 // Package config loads and validates mcp-resile.yaml, per spec.md §7.
 //
-// V1 only parses the server: section and the backends: list; auth,
-// policies, and telemetry are wired in by later features. Missing or
-// malformed required fields are rejected here, at load time, rather than
-// surfacing as a confusing failure on the first request. Field validation
-// is delegated to github.com/cinar/checker via struct tags; the one rule
-// checker can't express — that prefixes must be distinct across backends —
-// is checked separately, since checker only validates within one struct.
+// V1 parses the server: section, the backends: list, and the policies:
+// list's tool_pattern field (the rest of each policy's validation/resilience
+// fields are added by the features that consume them — FEATURE-011 onward);
+// auth and telemetry are wired in by later features. Missing or malformed
+// required fields are rejected here, at load time, rather than surfacing as
+// a confusing failure on the first request. Field validation is delegated
+// to github.com/cinar/checker via struct tags; rules checker can't express
+// — that prefixes must be distinct across backends, and that tool_pattern
+// must be a well-formed glob — are checked separately, since checker only
+// validates within one struct and has no glob-syntax checker.
 package config
 
 import (
 	"errors"
 	"fmt"
 	"os"
+	"path"
 	"sort"
 	"strings"
 	"time"
@@ -80,11 +84,20 @@ type Backend struct {
 	URL       string `yaml:"url" checkers:"required url"`
 }
 
+// Policy is one entry of the policies: list (spec.md §7). A tool name is
+// matched against ToolPattern (a path.Match glob) to resolve the policy
+// that governs it, per FEATURE-010. Later features (FEATURE-011 onward)
+// add the validation/resilience fields as they start consuming them.
+type Policy struct {
+	ToolPattern string `yaml:"tool_pattern" checkers:"required"`
+}
+
 // Config is the top-level mcp-resile.yaml document.
 type Config struct {
 	Version  string    `yaml:"version"`
 	Server   Server    `yaml:"server"`
 	Backends []Backend `yaml:"backends" checkers:"required"`
+	Policies []Policy  `yaml:"policies"`
 }
 
 // Load reads and validates the config file at path.
@@ -120,8 +133,16 @@ func Parse(data []byte) (*Config, error) {
 			return nil, checkerError(fmt.Sprintf("Backends[%d].", i), errs)
 		}
 	}
+	for i := range cfg.Policies {
+		if errs, ok := checker.Check(&cfg.Policies[i]); !ok {
+			return nil, checkerError(fmt.Sprintf("Policies[%d].", i), errs)
+		}
+	}
 
 	if err := validatePrefixes(cfg.Backends); err != nil {
+		return nil, err
+	}
+	if err := validatePolicies(cfg.Policies); err != nil {
 		return nil, err
 	}
 
@@ -150,6 +171,21 @@ func validatePrefixes(backends []Backend) error {
 		seenBy[b.Prefix] = b.ID
 	}
 
+	return nil
+}
+
+// validatePolicies checks that every policy's tool_pattern is a well-formed
+// glob per path.Match's syntax, so a malformed pattern is rejected here, at
+// load time, rather than silently never matching (or erroring) on the first
+// request that reaches policy.Resolver.Resolve. path.Match's error depends
+// only on the pattern, not the name being matched against, so matching
+// against "" is enough to surface a syntax error.
+func validatePolicies(policies []Policy) error {
+	for _, p := range policies {
+		if _, err := path.Match(p.ToolPattern, ""); err != nil {
+			return fmt.Errorf("policy %q: invalid tool_pattern: %w", p.ToolPattern, err)
+		}
+	}
 	return nil
 }
 

@@ -103,6 +103,39 @@ backends:
 	}
 }
 
+func TestParsePolicies(t *testing.T) {
+	yaml := `
+server:
+  listen: "0.0.0.0:8080"
+backends:
+  - id: "svc"
+    url: "http://svc.internal/mcp"
+policies:
+  - tool_pattern: "db_read_*"
+  - tool_pattern: "db_write_*"
+`
+	cfg, err := config.Parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if len(cfg.Policies) != 2 {
+		t.Fatalf("len(Policies) = %d, want 2", len(cfg.Policies))
+	}
+	if cfg.Policies[0].ToolPattern != "db_read_*" || cfg.Policies[1].ToolPattern != "db_write_*" {
+		t.Errorf("Policies = %+v, want tool_pattern db_read_* then db_write_*", cfg.Policies)
+	}
+}
+
+func TestParseNoPolicies(t *testing.T) {
+	cfg, err := config.Parse([]byte(validYAML))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if len(cfg.Policies) != 0 {
+		t.Errorf("len(Policies) = %d, want 0 (policies: is optional)", len(cfg.Policies))
+	}
+}
+
 func TestParseErrors(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -252,6 +285,32 @@ backends:
 			name:    "malformed yaml",
 			yaml:    "server: [this is not a map",
 			wantErr: "parsing config",
+		},
+		{
+			name: "missing policy tool_pattern",
+			yaml: `
+server:
+  listen: "0.0.0.0:8080"
+backends:
+  - id: "svc"
+    url: "http://svc.internal/mcp"
+policies:
+  - tool_pattern: ""
+`,
+			wantErr: "Policies[0].ToolPattern: is required",
+		},
+		{
+			name: "malformed policy glob",
+			yaml: `
+server:
+  listen: "0.0.0.0:8080"
+backends:
+  - id: "svc"
+    url: "http://svc.internal/mcp"
+policies:
+  - tool_pattern: "db_[read_*"
+`,
+			wantErr: "invalid tool_pattern",
 		},
 	}
 
