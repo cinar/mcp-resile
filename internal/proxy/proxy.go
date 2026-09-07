@@ -50,8 +50,10 @@ type Route struct {
 // doc comment). policies resolves the (unprefixed) tool name to the policy
 // governing its dispatch, if any (FEATURE-010 onward). Every tools/call is
 // also validated against its tool's own inputSchema before dispatch
-// (FEATURE-017), via a schema cache private to this Middleware call.
-func Middleware(routes []Route, router *NotificationRouter, policies *policy.Resolver) mcp.Middleware {
+// (FEATURE-017), via a schema cache private to this Middleware call, and a
+// successful response's text content is clamped to maxResponseBytes,
+// truncated with a notice appended if it doesn't fit (FEATURE-018).
+func Middleware(routes []Route, router *NotificationRouter, policies *policy.Resolver, maxResponseBytes int64) mcp.Middleware {
 	schemas := newSchemaCache()
 
 	return func(next mcp.MethodHandler) mcp.MethodHandler {
@@ -60,7 +62,7 @@ func Middleware(routes []Route, router *NotificationRouter, policies *policy.Res
 			case methodListTools:
 				return listTools(ctx, routes, schemas)
 			case methodCallTool:
-				return callTool(ctx, routes, req, next, router, policies, schemas)
+				return callTool(ctx, routes, req, next, router, policies, schemas, maxResponseBytes)
 			default:
 				return next(ctx, method, req)
 			}
@@ -124,8 +126,11 @@ func listTools(ctx context.Context, routes []Route, schemas *schemaCache) (*mcp.
 // no schema, its schema doesn't compile, or fetching it from the backend
 // errors — is not itself a violation: dispatch proceeds unvalidated and
 // lets the normal resilience pipeline handle a genuinely unreachable
-// backend, rather than a validation-layer error masking it.
-func callTool(ctx context.Context, routes []Route, req mcp.Request, next mcp.MethodHandler, router *NotificationRouter, policies *policy.Resolver, schemas *schemaCache) (mcp.Result, error) {
+// backend, rather than a validation-layer error masking it. A successful
+// response's text content is then clamped to maxResponseBytes, truncated
+// with a notice appended if it doesn't fit (FEATURE-018); this happens
+// after dispatch, unconditionally, regardless of policy match.
+func callTool(ctx context.Context, routes []Route, req mcp.Request, next mcp.MethodHandler, router *NotificationRouter, policies *policy.Resolver, schemas *schemaCache, maxResponseBytes int64) (mcp.Result, error) {
 	params, ok := req.GetParams().(*mcp.CallToolParamsRaw)
 	if !ok {
 		return nil, fmt.Errorf("proxy: unexpected params type %T for %s", req.GetParams(), methodCallTool)
@@ -175,7 +180,7 @@ func callTool(ctx context.Context, routes []Route, req mcp.Request, next mcp.Met
 		}
 		return nil, mapResilienceError(err, rateLimit)
 	}
-	return result, nil
+	return clampResponse(result, maxResponseBytes), nil
 }
 
 // baseResilienceOptions is what a tool name matching no policy dispatches

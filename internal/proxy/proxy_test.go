@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"net/http/httputil"
 	neturl "net/url"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -201,6 +202,11 @@ func dialTestBackend(t *testing.T, url string) *egress.Backend {
 	return backend
 }
 
+// defaultTestMaxResponseBytes is a generous response-size budget for tests
+// that aren't exercising FEATURE-018 truncation, so ordinary small test
+// responses are never accidentally clamped.
+const defaultTestMaxResponseBytes = 1 << 20
+
 // newTestGateway stands up the gateway's own ingress server with the proxy
 // middleware attached to routes, returning its URL. Its NotificationRouter
 // is private to this gateway; tests exercising notification forwarding
@@ -209,11 +215,18 @@ func dialTestBackend(t *testing.T, url string) *egress.Backend {
 // newRoutedTestSystem). policies is optional; most tests have none.
 func newTestGateway(t *testing.T, routes []proxy.Route, policies ...config.Policy) string {
 	t.Helper()
+	return newTestGatewayWithMaxResponseBytes(t, routes, defaultTestMaxResponseBytes, policies...)
+}
+
+// newTestGatewayWithMaxResponseBytes is newTestGateway with an explicit
+// response-size budget, for tests exercising FEATURE-018 truncation.
+func newTestGatewayWithMaxResponseBytes(t *testing.T, routes []proxy.Route, maxResponseBytes int64, policies ...config.Policy) string {
+	t.Helper()
 
 	router := proxy.NewNotificationRouter()
 	server := ingress.NewServer("mcp-resile", "test", proxy.MergeCapabilities(routes))
 	router.Attach(server)
-	server.AddReceivingMiddleware(proxy.Middleware(routes, router, policy.NewResolver(policies)))
+	server.AddReceivingMiddleware(proxy.Middleware(routes, router, policy.NewResolver(policies), maxResponseBytes))
 
 	httpServer := httptest.NewServer(ingress.NewHandler(server))
 	t.Cleanup(httpServer.Close)
@@ -279,7 +292,7 @@ func newRoutedTestSystem(t *testing.T, backendURL string) string {
 	routes := []proxy.Route{{Prefix: "", Backend: backend}}
 	server := ingress.NewServer("mcp-resile", "test", proxy.MergeCapabilities(routes))
 	router.Attach(server)
-	server.AddReceivingMiddleware(proxy.Middleware(routes, router, policy.NewResolver(nil)))
+	server.AddReceivingMiddleware(proxy.Middleware(routes, router, policy.NewResolver(nil), defaultTestMaxResponseBytes))
 
 	httpServer := httptest.NewServer(ingress.NewHandler(server))
 	t.Cleanup(httpServer.Close)
@@ -850,5 +863,45 @@ func TestSchemaCompiledOnce(t *testing.T) {
 
 	if got := listCalls.Load(); got != 1 {
 		t.Errorf("backend saw %d tools/list requests across 5 tools/call, want exactly 1 (the schema is cached after the first)", got)
+	}
+}
+
+// TestResponseClampingTruncatesOversizedBackendResult proves
+// max_response_bytes is enforced end-to-end (FEATURE-018): a real
+// backend's response that exceeds the configured budget comes back
+// truncated with the "[TRUNCATED: ...]" notice appended, and isError
+// stays false.
+func TestResponseClampingTruncatesOversizedBackendResult(t *testing.T) {
+	ctx := context.Background()
+	backendURL, _ := newCountingBackend(t, "echo")
+	backend := dialTestBackend(t, backendURL)
+	gatewayURL := newTestGatewayWithMaxResponseBytes(t, []proxy.Route{{Prefix: "", Backend: backend}}, 50)
+	session := connect(t, gatewayURL)
+
+	big := strings.Repeat("x", 10000)
+	result, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "echo", Arguments: map[string]any{"text": big}})
+	if err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("result.IsError = true, want false (a truncated response is still a successful call), content: %+v", result.Content)
+	}
+	if len(result.Content) == 0 {
+		t.Fatal("result.Content is empty, want at least the truncation notice")
+	}
+
+	last, ok := result.Content[len(result.Content)-1].(*mcp.TextContent)
+	if !ok || last.Text != "[TRUNCATED: response exceeded max_response_bytes]" {
+		t.Fatalf("last content block = %+v, want the truncation notice", result.Content[len(result.Content)-1])
+	}
+
+	var totalText int
+	for _, c := range result.Content {
+		if tc, ok := c.(*mcp.TextContent); ok {
+			totalText += len(tc.Text)
+		}
+	}
+	if totalText >= len(big) {
+		t.Errorf("total text content = %d bytes, want it well under the original %d-byte response", totalText, len(big))
 	}
 }

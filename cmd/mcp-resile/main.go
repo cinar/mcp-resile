@@ -46,7 +46,7 @@ func run(configPath string) error {
 
 	server := ingress.NewServer(serverName, version.Version, proxy.MergeCapabilities(routes))
 	router.Attach(server)
-	server.AddReceivingMiddleware(proxy.Middleware(routes, router, policies))
+	server.AddReceivingMiddleware(proxy.Middleware(routes, router, policies, cfg.Server.MaxResponseBytes))
 
 	httpServer := &http.Server{
 		Addr:         cfg.Server.Listen,
