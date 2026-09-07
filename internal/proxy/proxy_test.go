@@ -648,3 +648,43 @@ func TestRetriesDoNotRetryNonTransientErrors(t *testing.T) {
 		t.Errorf("backend saw %d tools/call attempts for a non-transient error, want exactly 1 (no retry)", got)
 	}
 }
+
+// TestRateLimitRejectsExcessCalls proves a policy's rate limit actually
+// gates dispatch end-to-end (FEATURE-013): with a bucket of 1 token per
+// minute, a second call within that window is rejected without reaching
+// the backend at all.
+func TestRateLimitRejectsExcessCalls(t *testing.T) {
+	ctx := context.Background()
+	backendURL, calls := newCountingBackend(t, "echo")
+	backend := dialTestBackend(t, backendURL)
+	gatewayURL := newTestGateway(t, []proxy.Route{{Prefix: "", Backend: backend}}, config.Policy{
+		ToolPattern: "echo",
+		Resilience: config.Resilience{
+			RateLimit: &config.RateLimit{
+				Rate:     1,
+				Interval: config.Duration(time.Minute),
+			},
+		},
+	})
+	session := connect(t, gatewayURL)
+
+	first, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "echo", Arguments: map[string]any{"text": "hi"}})
+	if err != nil {
+		t.Fatalf("first CallTool: %v, want it to succeed (the bucket starts full)", err)
+	}
+	if first.IsError {
+		t.Fatalf("first CallTool result.IsError = true, content: %+v", first.Content)
+	}
+
+	_, err = session.CallTool(ctx, &mcp.CallToolParams{Name: "echo", Arguments: map[string]any{"text": "hi"}})
+	if err == nil {
+		t.Fatal("second CallTool: got nil error, want the rate limit to reject it")
+	}
+	if !strings.Contains(err.Error(), "rate limit exceeded") {
+		t.Errorf("second CallTool error = %q, want it to mention the rate limit", err.Error())
+	}
+
+	if got := calls.Load(); got != 1 {
+		t.Errorf("backend tool handler ran %d times, want exactly 1 (the rate-limited call never reached it)", got)
+	}
+}

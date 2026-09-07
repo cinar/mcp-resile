@@ -232,6 +232,36 @@ policies:
 	}
 }
 
+func TestParsePolicyRateLimit(t *testing.T) {
+	yaml := `
+server:
+  listen: "0.0.0.0:8080"
+backends:
+  - id: "svc"
+    url: "http://svc.internal/mcp"
+policies:
+  - tool_pattern: "db_read_*"
+    resilience:
+      rate_limit:
+        rate: 100.0
+        interval: "1s"
+`
+	cfg, err := config.Parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	rl := cfg.Policies[0].Resilience.RateLimit
+	if rl == nil {
+		t.Fatal("Policies[0].Resilience.RateLimit is nil, want it populated")
+	}
+	if rl.Rate != 100.0 {
+		t.Errorf("Rate = %v, want 100.0", rl.Rate)
+	}
+	if time.Duration(rl.Interval) != time.Second {
+		t.Errorf("Interval = %v, want 1s", time.Duration(rl.Interval))
+	}
+}
+
 func TestParseNoPolicies(t *testing.T) {
 	cfg, err := config.Parse([]byte(validYAML))
 	if err != nil {
@@ -481,6 +511,38 @@ policies:
         backoff: "exponential"
 `,
 			wantErr: `retries.backoff: unsupported backoff "exponential"`,
+		},
+		{
+			name: "rate limit missing rate",
+			yaml: `
+server:
+  listen: "0.0.0.0:8080"
+backends:
+  - id: "svc"
+    url: "http://svc.internal/mcp"
+policies:
+  - tool_pattern: "db_read_*"
+    resilience:
+      rate_limit:
+        interval: "1s"
+`,
+			wantErr: "rate_limit.rate: must be greater than 0",
+		},
+		{
+			name: "rate limit missing interval",
+			yaml: `
+server:
+  listen: "0.0.0.0:8080"
+backends:
+  - id: "svc"
+    url: "http://svc.internal/mcp"
+policies:
+  - tool_pattern: "db_read_*"
+    resilience:
+      rate_limit:
+        rate: 100.0
+`,
+			wantErr: "rate_limit.interval: must be greater than 0",
 		},
 	}
 

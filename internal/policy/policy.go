@@ -15,26 +15,35 @@ import (
 	"path"
 	"time"
 
+	"github.com/cinar/resile"
 	"github.com/cinar/resile/circuit"
 
 	"github.com/cinar/mcp-resile/internal/config"
 )
 
 // Policy pairs one config.Policy with the resile primitives it configures.
-// A primitive such as a circuit breaker holds state that must persist
-// across every call matching this policy, so it's built once, here, rather
-// than fresh per call — Resolver hands out the same *Policy (and therefore
-// the same underlying *circuit.Breaker) every time a tool name matches it.
+// A primitive such as a circuit breaker or rate limiter holds state that
+// must persist across every call matching this policy, so it's built once,
+// here, rather than fresh per call — Resolver hands out the same *Policy
+// (and therefore the same underlying primitives) every time a tool name
+// matches it.
 type Policy struct {
 	config.Policy
 
 	circuitBreaker *circuit.Breaker
+	rateLimiter    *resile.RateLimiter
 }
 
 // CircuitBreaker returns the policy's circuit breaker, or nil if its
 // resilience.circuit_breaker: block wasn't configured.
 func (p *Policy) CircuitBreaker() *circuit.Breaker {
 	return p.circuitBreaker
+}
+
+// RateLimiter returns the policy's rate limiter, or nil if its
+// resilience.rate_limit: block wasn't configured.
+func (p *Policy) RateLimiter() *resile.RateLimiter {
+	return p.rateLimiter
 }
 
 // newPolicy builds the runtime Policy for one config.Policy, constructing
@@ -53,6 +62,10 @@ func newPolicy(cfg config.Policy) *Policy {
 			FailureRateThreshold: cb.FailureRate,
 			ResetTimeout:         time.Duration(cb.ResetTimeout),
 		})
+	}
+
+	if rl := cfg.Resilience.RateLimit; rl != nil {
+		p.rateLimiter = resile.NewRateLimiter(rl.Rate, time.Duration(rl.Interval))
 	}
 
 	return p

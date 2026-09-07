@@ -121,12 +121,23 @@ type Retries struct {
 	Backoff     string   `yaml:"backoff"`
 }
 
+// RateLimit is the resilience.rate_limit: sub-block of a policy (spec.md
+// §7), mapping onto resile.NewRateLimiter (FEATURE-013). Unlike
+// CircuitBreaker/Retries, there's no sensible zero-value default: resile's
+// token bucket rejects every request at Rate 0, and divides by zero
+// internally at Interval 0 — so validateRateLimit requires both whenever
+// rate_limit: is present, rather than silently defaulting either.
+type RateLimit struct {
+	Rate     float64  `yaml:"rate"`
+	Interval Duration `yaml:"interval"`
+}
+
 // Resilience is the resilience: sub-block of a policy (spec.md §7). Later
-// features (FEATURE-013 onward) add rate_limit/timeout as they start
-// consuming them.
+// features add timeout as they start consuming it.
 type Resilience struct {
 	CircuitBreaker *CircuitBreaker `yaml:"circuit_breaker"`
 	Retries        *Retries        `yaml:"retries"`
+	RateLimit      *RateLimit      `yaml:"rate_limit"`
 }
 
 // Policy is one entry of the policies: list (spec.md §7). A tool name is
@@ -237,6 +248,9 @@ func validatePolicies(policies []Policy) error {
 		if err := validateRetries(p.Resilience.Retries); err != nil {
 			return fmt.Errorf("policy %q: %w", p.ToolPattern, err)
 		}
+		if err := validateRateLimit(p.Resilience.RateLimit); err != nil {
+			return fmt.Errorf("policy %q: %w", p.ToolPattern, err)
+		}
 	}
 	return nil
 }
@@ -278,6 +292,23 @@ func validateRetries(r *Retries) error {
 	}
 	if r.Backoff != backoffFullJitter {
 		return fmt.Errorf("retries.backoff: unsupported backoff %q, only %q is supported in v1", r.Backoff, backoffFullJitter)
+	}
+	return nil
+}
+
+// validateRateLimit requires both fields whenever rate_limit: is present:
+// unlike the other resilience blocks, there's no zero value that means
+// "unset, use a sensible default" here — resile.NewRateLimiter(0, x) simply
+// rejects every request, and interval 0 divides by zero internally.
+func validateRateLimit(rl *RateLimit) error {
+	if rl == nil {
+		return nil
+	}
+	if rl.Rate <= 0 {
+		return fmt.Errorf("rate_limit.rate: must be greater than 0, got %v", rl.Rate)
+	}
+	if rl.Interval <= 0 {
+		return fmt.Errorf("rate_limit.interval: must be greater than 0")
 	}
 	return nil
 }

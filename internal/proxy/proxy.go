@@ -128,11 +128,12 @@ func callTool(ctx context.Context, routes []Route, req mcp.Request, next mcp.Met
 
 	opts := resilienceOptions(p)
 	if len(opts) == 0 {
-		// No circuit breaker or retries configured for this policy: dispatch
-		// directly rather than through an "empty" resile.Do, which would
-		// otherwise silently inherit resile.DefaultConfig's own defaults
-		// (e.g. a 5ms MinDeadlineThreshold) ahead of FEATURE-015 wiring it
-		// up on purpose.
+		// No circuit breaker, retries, or rate limit configured for this
+		// policy: dispatch directly rather than through an "empty"
+		// resile.Do, which would otherwise silently inherit
+		// resile.DefaultConfig's own defaults (e.g. a 5ms
+		// MinDeadlineThreshold) ahead of FEATURE-015 wiring it up on
+		// purpose.
 		return dispatch(ctx)
 	}
 
@@ -140,14 +141,18 @@ func callTool(ctx context.Context, routes []Route, req mcp.Request, next mcp.Met
 }
 
 // resilienceOptions builds the resile.Options a policy's dispatch should run
-// with. A circuit breaker and retries can both be configured on the same
-// policy and combine into one resile.Do call, matching spec.md §8's
-// ToolExecutionEngine example.
+// with. A circuit breaker, retries, and a rate limit can all be configured
+// on the same policy and combine into one resile.Do call, matching
+// spec.md §8's ToolExecutionEngine example.
 func resilienceOptions(p *policy.Policy) []resile.Option {
 	var opts []resile.Option
 
 	if cb := p.CircuitBreaker(); cb != nil {
 		opts = append(opts, resile.WithCircuitBreaker(cb))
+	}
+
+	if rl := p.RateLimiter(); rl != nil {
+		opts = append(opts, resile.WithRateLimiterInstance(rl))
 	}
 
 	if r := p.Resilience.Retries; r != nil {
@@ -157,7 +162,8 @@ func resilienceOptions(p *policy.Policy) []resile.Option {
 			resile.WithRetryIfFunc(isTransientError),
 		)
 	} else if len(opts) > 0 {
-		// A circuit breaker but no retries: pin attempts to 1. resile.Do
+		// A circuit breaker and/or rate limit but no retries: pin attempts
+		// to 1. resile.Do
 		// otherwise defaults to 5 attempts with full-jitter backoff
 		// (resile.DefaultConfig), which would silently retry on this
 		// policy's behalf without it having asked for that.

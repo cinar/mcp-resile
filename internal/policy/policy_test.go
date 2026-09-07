@@ -177,6 +177,58 @@ func TestCircuitBreakerTripsAndResets(t *testing.T) {
 	}
 }
 
+func TestNoRateLimiterWhenUnconfigured(t *testing.T) {
+	r := policy.NewResolver([]config.Policy{
+		{ToolPattern: "db_read_*"},
+	})
+
+	p, ok := r.Resolve("db_read_users")
+	if !ok {
+		t.Fatal("Resolve should have matched db_read_*")
+	}
+	if p.RateLimiter() != nil {
+		t.Error("RateLimiter() should be nil when resilience.rate_limit is unconfigured")
+	}
+}
+
+// TestRateLimiterSharedAcrossCalls drives the *resile.RateLimiter built from
+// a policy's resilience.rate_limit: config directly (FEATURE-013), proving
+// its token bucket is shared (and therefore actually drains) across every
+// call resolving to the same policy, rather than resetting per call.
+func TestRateLimiterSharedAcrossCalls(t *testing.T) {
+	r := policy.NewResolver([]config.Policy{
+		{
+			ToolPattern: "db_read_*",
+			Resilience: config.Resilience{
+				RateLimit: &config.RateLimit{
+					Rate:     1,
+					Interval: config.Duration(time.Minute),
+				},
+			},
+		},
+	})
+
+	p, ok := r.Resolve("db_read_users")
+	if !ok {
+		t.Fatal("Resolve should have matched db_read_*")
+	}
+	rl := p.RateLimiter()
+	if rl == nil {
+		t.Fatal("RateLimiter() should be non-nil when resilience.rate_limit is configured")
+	}
+
+	if !rl.Acquire(t.Context()) {
+		t.Fatal("first Acquire should succeed: the bucket starts full")
+	}
+
+	// A second, unrelated call resolving to the same policy shares the same
+	// bucket, which the first Acquire above already drained.
+	p2, _ := r.Resolve("db_read_accounts")
+	if p2.RateLimiter().Acquire(t.Context()) {
+		t.Error("second Acquire should fail: the shared bucket has no tokens left within the 1-minute interval")
+	}
+}
+
 var errBackend = errBackendError{}
 
 type errBackendError struct{}
