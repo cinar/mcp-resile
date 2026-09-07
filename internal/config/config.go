@@ -1,17 +1,18 @@
 // Package config loads and validates mcp-resile.yaml, per spec.md §7.
 //
-// V1 only parses the server: section and a single-entry backends: list;
-// auth, policies, and telemetry are wired in by later features. Missing or
+// V1 only parses the server: section and the backends: list; auth,
+// policies, and telemetry are wired in by later features. Missing or
 // malformed required fields are rejected here, at load time, rather than
 // surfacing as a confusing failure on the first request. Field validation
-// is delegated to github.com/cinar/checker via struct tags.
+// is delegated to github.com/cinar/checker via struct tags; the one rule
+// checker can't express — that prefixes must be distinct across backends —
+// is checked separately, since checker only validates within one struct.
 package config
 
 import (
 	"errors"
 	"fmt"
 	"os"
-	"reflect"
 	"sort"
 	"strings"
 	"time"
@@ -36,24 +37,11 @@ const (
 var (
 	errUnsupportedServerTransport  = fmt.Errorf("unsupported transport, only %q is supported in v1", transportStreamableHTTP)
 	errUnsupportedBackendTransport = fmt.Errorf("unsupported transport, only %q is supported in v1", backendTransportHTTP)
-	errNotSingleBackend            = errors.New("v1 supports exactly one backend")
 )
 
 func init() {
 	checker.Register("server-transport", checker.MakeRegexpMaker("^"+transportStreamableHTTP+"$", errUnsupportedServerTransport))
 	checker.Register("backend-transport", checker.MakeRegexpMaker("^"+backendTransportHTTP+"$", errUnsupportedBackendTransport))
-	checker.Register("single-backend", makeSingleBackend)
-}
-
-// makeSingleBackend makes a checker.CheckFunc enforcing the v1 restriction
-// of exactly one backend. Multi-backend routing arrives with FEATURE-007.
-func makeSingleBackend(_ string) checker.CheckFunc {
-	return func(value, _ reflect.Value) error {
-		if n := value.Len(); n != 1 {
-			return fmt.Errorf("%w, got %d", errNotSingleBackend, n)
-		}
-		return nil
-	}
 }
 
 // Duration wraps time.Duration to unmarshal from YAML duration strings
@@ -96,7 +84,7 @@ type Backend struct {
 type Config struct {
 	Version  string    `yaml:"version"`
 	Server   Server    `yaml:"server"`
-	Backends []Backend `yaml:"backends" checkers:"single-backend"`
+	Backends []Backend `yaml:"backends" checkers:"required"`
 }
 
 // Load reads and validates the config file at path.
@@ -122,16 +110,47 @@ func Parse(data []byte) (*Config, error) {
 	cfg.applyDefaults()
 
 	// checker.Check only recurses into struct-kind fields, so the Backends
-	// slice is checked for cardinality here, and its one element (once
-	// cardinality is confirmed) is checked separately below.
+	// slice itself is checked here (for the required, non-empty rule), and
+	// each of its elements is checked separately in the loop below.
 	if errs, ok := checker.Check(&cfg); !ok {
 		return nil, checkerError("", errs)
 	}
-	if errs, ok := checker.Check(&cfg.Backends[0]); !ok {
-		return nil, checkerError("Backends[0].", errs)
+	for i := range cfg.Backends {
+		if errs, ok := checker.Check(&cfg.Backends[i]); !ok {
+			return nil, checkerError(fmt.Sprintf("Backends[%d].", i), errs)
+		}
+	}
+
+	if err := validatePrefixes(cfg.Backends); err != nil {
+		return nil, err
 	}
 
 	return &cfg, nil
+}
+
+// validatePrefixes enforces spec.md §5.1's namespace conflict resolution:
+// once more than one backend is configured, each must carry a distinct,
+// non-empty prefix so gateway-side tool names can never collide. A lone
+// backend may leave prefix empty and pass its tools through unprefixed.
+// This compares across list elements, so it can't be a checker struct tag
+// (checker only validates fields within one struct at a time).
+func validatePrefixes(backends []Backend) error {
+	if len(backends) < 2 {
+		return nil
+	}
+
+	seenBy := make(map[string]string, len(backends))
+	for _, b := range backends {
+		if b.Prefix == "" {
+			return fmt.Errorf("backend %q: prefix is required when more than one backend is configured", b.ID)
+		}
+		if owner, ok := seenBy[b.Prefix]; ok {
+			return fmt.Errorf("backends %q and %q: duplicate prefix %q", owner, b.ID, b.Prefix)
+		}
+		seenBy[b.Prefix] = b.ID
+	}
+
+	return nil
 }
 
 // applyDefaults fills in optional fields left unset in the YAML, before

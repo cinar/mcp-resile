@@ -79,6 +79,30 @@ backends:
 	}
 }
 
+func TestParseMultipleBackendsRequireDistinctPrefixes(t *testing.T) {
+	yaml := `
+server:
+  listen: "0.0.0.0:8080"
+backends:
+  - id: "database-service"
+    prefix: "db_"
+    url: "http://db-primary.internal:9000/mcp"
+  - id: "issue-tracker"
+    prefix: "jira_"
+    url: "http://jira.internal/mcp"
+`
+	cfg, err := config.Parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if len(cfg.Backends) != 2 {
+		t.Fatalf("len(Backends) = %d, want 2", len(cfg.Backends))
+	}
+	if cfg.Backends[0].Prefix != "db_" || cfg.Backends[1].Prefix != "jira_" {
+		t.Errorf("Backends = %+v, want prefixes db_ and jira_", cfg.Backends)
+	}
+}
+
 func TestParseErrors(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -114,10 +138,10 @@ server:
   listen: "0.0.0.0:8080"
 backends: []
 `,
-			wantErr: "v1 supports exactly one backend, got 0",
+			wantErr: "Backends: is required",
 		},
 		{
-			name: "two backends",
+			name: "two backends missing prefix",
 			yaml: `
 server:
   listen: "0.0.0.0:8080"
@@ -125,9 +149,25 @@ backends:
   - id: "a"
     url: "http://a.internal/mcp"
   - id: "b"
+    prefix: "b_"
     url: "http://b.internal/mcp"
 `,
-			wantErr: "v1 supports exactly one backend, got 2",
+			wantErr: `backend "a": prefix is required when more than one backend is configured`,
+		},
+		{
+			name: "two backends duplicate prefix",
+			yaml: `
+server:
+  listen: "0.0.0.0:8080"
+backends:
+  - id: "a"
+    prefix: "svc_"
+    url: "http://a.internal/mcp"
+  - id: "b"
+    prefix: "svc_"
+    url: "http://b.internal/mcp"
+`,
+			wantErr: `duplicate prefix "svc_"`,
 		},
 		{
 			name: "missing backend id",
